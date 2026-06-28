@@ -27,7 +27,8 @@ export function Sidebar({
     <aside className="flex flex-col w-60 border-r border-grid-bounds matrix-border bg-bg-surface">
       <div className="flex items-center justify-between px-3 py-2 border-b border-grid-bounds">
         <span className="text-[10px] tracking-[0.2em] uppercase text-zinc-500">
-          registry
+          registry{" "}
+          <span className="text-zinc-600 tabular-nums">({servers.length})</span>
         </span>
         <div className="flex gap-1">
           <button

@@ -63,7 +63,13 @@ export function ServerForm({ initial, onSubmit, onCancel }: ServerFormProps) {
   }
 
   return (
-    <form onSubmit={handleSubmit} className="max-w-xl p-4 space-y-5">
+    <form
+      onSubmit={handleSubmit}
+      onKeyDown={(e) => {
+        if (e.key === "Escape" && !submitting) onCancel();
+      }}
+      className="max-w-xl p-4 space-y-5"
+    >
       <h2 className="text-[10px] tracking-[0.2em] uppercase text-zinc-500">
         {initial ? "edit instance" : "register instance"}
       </h2>

@@ -12,6 +12,9 @@ interface ViewportProps {
   rows: number;
   shader: MatrixShader;
   telemetry: ShaderTelemetry;
+  /** Minimum milliseconds between frames. Default 50 (~20fps) — keeps the
+   * animation calm and avoids saturating a CPU core with a dot field. */
+  throttleMs?: number;
   /** Optional className to control sizing/positioning of the wrapper. */
   className?: string;
 }
@@ -39,6 +42,7 @@ export function MatrixViewport({
   rows,
   shader,
   telemetry,
+  throttleMs = 50,
   className,
 }: ViewportProps) {
   const [buffer, setBuffer] = useState<MatrixBuffer>(() =>
@@ -54,8 +58,14 @@ export function MatrixViewport({
   useEffect(() => {
     let tick = 0;
     let frameId = 0;
+    let last = 0;
 
-    const renderLoop = () => {
+    const renderLoop = (now: number) => {
+      frameId = requestAnimationFrame(renderLoop);
+      // Throttle to throttleMs so the dot field stays a calm ambient effect
+      // rather than re-rendering at the display's full refresh rate.
+      if (now - last < throttleMs) return;
+      last = now;
       tick++;
       const context: ShaderContext = {
         tick,
@@ -64,12 +74,11 @@ export function MatrixViewport({
         telemetry: telemetryRef.current,
       };
       setBuffer(shaderRef.current(context));
-      frameId = requestAnimationFrame(renderLoop);
     };
 
     frameId = requestAnimationFrame(renderLoop);
     return () => cancelAnimationFrame(frameId);
-  }, [cols, rows]);
+  }, [cols, rows, throttleMs]);
 
   return (
     <div

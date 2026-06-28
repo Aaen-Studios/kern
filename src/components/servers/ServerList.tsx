@@ -2,6 +2,7 @@ import type { ServerInstance } from "../../types/server";
 import { ServerCard } from "./ServerCard";
 import { MatrixViewport } from "../matrix/MatrixViewport";
 import { polarRadarShader } from "../matrix/shaders/polarRadar";
+import type { DotColor } from "../../types/matrix";
 
 interface ServerListProps {
   servers: ServerInstance[];
@@ -9,6 +10,21 @@ interface ServerListProps {
   onEdit: (server: ServerInstance) => void;
   onAdd: () => void;
 }
+
+/** Color swatches for the status-axis legend, mirroring status.ts. */
+const LEGEND: { color: DotColor; label: string }[] = [
+  { color: "green", label: "running" },
+  { color: "amber", label: "transition / warn" },
+  { color: "crimson", label: "orphaned / fault" },
+  { color: "gray", label: "stopped" },
+];
+
+const DOT_HEX: Record<DotColor, string> = {
+  green: "#4cf5a0",
+  amber: "#f5a04c",
+  crimson: "#f54c4c",
+  gray: "#4c525e",
+};
 
 /**
  * Overview of the registry. The empty state frames the radar viewport so the
@@ -19,10 +35,10 @@ export function ServerList({ servers, onDelete, onEdit, onAdd }: ServerListProps
     return (
       <div className="flex flex-col items-center justify-center h-full gap-6 p-8">
         <MatrixViewport
-          cols={9}
-          rows={9}
+          cols={11}
+          rows={11}
           shader={polarRadarShader}
-          telemetry={{ cpu: 0.12, ram: 0.2, status: "idle" }}
+          telemetry={{ cpu: 0.1, ram: 0.18, status: "idle" }}
         />
         <div className="text-center">
           <p className="text-sm text-zinc-300">no server instances registered</p>
@@ -42,9 +58,23 @@ export function ServerList({ servers, onDelete, onEdit, onAdd }: ServerListProps
 
   return (
     <div className="p-4">
-      <h2 className="mb-3 text-[10px] tracking-[0.2em] uppercase text-zinc-500">
-        all instances
-      </h2>
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-[10px] tracking-[0.2em] uppercase text-zinc-500">
+          all instances{" "}
+          <span className="text-zinc-600 tabular-nums">({servers.length})</span>
+        </h2>
+        <ul className="flex items-center gap-3">
+          {LEGEND.map((entry) => (
+            <li key={entry.color} className="flex items-center gap-1">
+              <span
+                className="inline-block w-1.5 h-1.5 rounded-full"
+                style={{ backgroundColor: DOT_HEX[entry.color] }}
+              />
+              <span className="text-[10px] text-zinc-600">{entry.label}</span>
+            </li>
+          ))}
+        </ul>
+      </div>
       <div className="grid gap-3 grid-cols-1 lg:grid-cols-2">
         {servers.map((server) => (
           <ServerCard

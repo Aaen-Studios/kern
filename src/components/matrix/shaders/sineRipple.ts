@@ -18,8 +18,8 @@ export const sineRippleShader: MatrixShader = (ctx) => {
     // Measure geometric Euclidean distance from origin.
     const distance = Math.sqrt(x * x + y * y);
 
-    // Wave propagation velocity calculation.
-    const waveValue = Math.sin(distance - tick * 0.25);
+    // Wave propagation velocity — kept slow so ripples expand gently.
+    const waveValue = Math.sin(distance - tick * 0.08);
     const intensity = Math.max(0.1, (waveValue + 1.0) / 2.0);
 
     buffer.push({ intensity, color: "green" });

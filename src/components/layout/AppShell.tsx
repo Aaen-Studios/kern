@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Header } from "./Header";
+import { TitleBar } from "./TitleBar";
 import { Sidebar } from "./Sidebar";
 import type { ServerInstance } from "../../types/server";
 
@@ -14,8 +14,9 @@ interface AppShellProps {
 }
 
 /**
- * Full-viewport application shell: header on top, sidebar left, main content
- * area right. Spacing follows the 4px grid scale (DesignGuide §6.2).
+ * Full-viewport application shell: custom title bar on top, registry sidebar
+ * on the left, scrollable main content area on the right. Spacing follows the
+ * 4px grid scale (DesignGuide §6.2).
  */
 export function AppShell({
   servers,
@@ -28,7 +29,7 @@ export function AppShell({
 }: AppShellProps) {
   return (
     <div className="flex flex-col h-screen overflow-hidden bg-bg-core">
-      <Header instanceCount={servers.length} />
+      <TitleBar />
       <div className="flex flex-1 min-h-0">
         <Sidebar
           servers={servers}

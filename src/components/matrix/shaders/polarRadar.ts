@@ -16,8 +16,9 @@ export const polarRadarShader: MatrixShader = (ctx) => {
   const centerX = (cols - 1) / 2;
   const centerY = (rows - 1) / 2;
 
-  // Speed escalates gracefully based on actual processor load.
-  const sweepAngle = (tick * (0.08 + telemetry.cpu * 0.32)) % (Math.PI * 2);
+  // Sweep speed escalates with processor load. The base rate is kept slow so
+  // the field reads as a calm ambient sweep rather than a strobe.
+  const sweepAngle = (tick * (0.025 + telemetry.cpu * 0.06)) % (Math.PI * 2);
 
   for (let i = 0; i < cols * rows; i++) {
     const x = (i % cols) - centerX;
