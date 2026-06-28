@@ -2,6 +2,10 @@
 
 mod commands;
 mod config;
+mod manifest;
+mod process;
+mod scaffold;
+mod seed;
 mod window_state;
 
 use tauri::{Manager, WindowEvent};
@@ -10,7 +14,15 @@ use tauri::{Manager, WindowEvent};
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
+        .manage(process::ProcessRegistry::default())
         .setup(|app| {
+            // Seed sample community plugins from the repo into AppData so the
+            // manifest engine can discover them during development.
+            if let Ok(base) = config::config_dir(app.handle()) {
+                seed::seed(&manifest::plugins_dir(&base));
+            }
             // Restore last-saved window geometry before the window is shown.
             if let Some(window) = app.get_webview_window("main") {
                 if let Ok(Some(state)) = window_state::load(app.handle()) {
@@ -35,7 +47,26 @@ pub fn run() {
             commands::create_server,
             commands::update_server,
             commands::delete_server,
+            commands::delete_server_folder,
             commands::refresh_orphaned_status,
+            commands::is_server_running,
+            commands::launch_server_instance,
+            commands::stop_server_instance,
+            commands::update_server_status,
+            commands::run_lifecycle_step,
+            commands::install_server_instance,
+            commands::restart_server_instance,
+            commands::get_log_tail,
+            commands::open_folder,
+            commands::write_stdin_to_instance,
+            commands::read_env_file,
+            commands::server_file_exists,
+            commands::write_server_file,
+            commands::list_plugins,
+            commands::get_plugin,
+            commands::get_plugin_ui_path,
+            commands::install_plugin,
+            commands::uninstall_plugin,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

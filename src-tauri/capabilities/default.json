@@ -18,6 +18,17 @@
     "core:window:allow-show",
     "core:window:allow-set-focus",
     "core:window:allow-is-maximized",
-    "opener:default"
+    "opener:default",
+    "dialog:default",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "binaries",
+          "command": "",
+          "args": true
+        }
+      ]
+    }
   ]
 }

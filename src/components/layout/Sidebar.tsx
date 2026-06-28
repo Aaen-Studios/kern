@@ -8,6 +8,10 @@ interface SidebarProps {
   onSelect: (id: string) => void;
   onAdd: () => void;
   onRefresh: () => void;
+  /** True when the plugins management view is active. */
+  showPlugins: boolean;
+  /** Navigate to the plugin management view. */
+  onNavigatePlugins: () => void;
 }
 
 /**
@@ -22,6 +26,8 @@ export function Sidebar({
   onSelect,
   onAdd,
   onRefresh,
+  showPlugins,
+  onNavigatePlugins,
 }: SidebarProps) {
   return (
     <aside className="flex flex-col w-60 border-r border-grid-bounds matrix-border bg-bg-surface">
@@ -95,6 +101,24 @@ export function Sidebar({
             );
           })}
         </ul>
+      </nav>
+
+      {/* Bottom navigation */}
+      <nav className="border-t border-grid-bounds">
+        <button
+          onClick={onNavigatePlugins}
+          className={`flex w-full items-center gap-2 px-3 py-2.5 text-left border-l-2 transition-colors ${
+            showPlugins
+              ? "border-signal-high bg-bg-core"
+              : "border-transparent hover:bg-bg-core"
+          }`}
+        >
+          <span className="text-[11px] text-zinc-500">◆</span>
+          <span className="flex-1 text-xs text-zinc-400">plugins</span>
+          <span className="text-[9px] text-zinc-600 uppercase tracking-wider">
+            manage
+          </span>
+        </button>
       </nav>
     </aside>
   );

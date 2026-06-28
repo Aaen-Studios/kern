@@ -14,6 +14,7 @@ export function statusColor(server: ServerInstance): DotColor {
       return "green";
     case "starting":
     case "stopping":
+    case "installing":
       return "amber";
     case "stopped":
     default:

@@ -5,7 +5,7 @@
  */
 
 /** Lifecycle of a tracked server instance. */
-export type ServerStatus = "stopped" | "starting" | "running" | "stopping" | "error";
+export type ServerStatus = "stopped" | "starting" | "running" | "stopping" | "installing" | "error";
 
 /** A tracked server instance in config.json. */
 export interface ServerInstance {

@@ -8,6 +8,8 @@ interface ServerListProps {
   servers: ServerInstance[];
   onDelete: (id: string) => void;
   onEdit: (server: ServerInstance) => void;
+  /** Navigate to the detail view for a server. */
+  onSelect?: (id: string) => void;
   onAdd: () => void;
 }
 
@@ -30,7 +32,7 @@ const DOT_HEX: Record<DotColor, string> = {
  * Overview of the registry. The empty state frames the radar viewport so the
  * host is never visually idle — the sweep pulses even with no instances.
  */
-export function ServerList({ servers, onDelete, onEdit, onAdd }: ServerListProps) {
+export function ServerList({ servers, onDelete, onEdit, onAdd, onSelect }: ServerListProps) {
   if (servers.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center h-full gap-6 p-8">
@@ -82,6 +84,7 @@ export function ServerList({ servers, onDelete, onEdit, onAdd }: ServerListProps
             server={server}
             onDelete={onDelete}
             onEdit={onEdit}
+            onSelect={onSelect}
           />
         ))}
       </div>

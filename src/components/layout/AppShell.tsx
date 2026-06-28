@@ -10,6 +10,8 @@ interface AppShellProps {
   onSelect: (id: string) => void;
   onAdd: () => void;
   onRefresh: () => void;
+  showPlugins: boolean;
+  onNavigatePlugins: () => void;
   children: ReactNode;
 }
 
@@ -25,6 +27,8 @@ export function AppShell({
   onSelect,
   onAdd,
   onRefresh,
+  showPlugins,
+  onNavigatePlugins,
   children,
 }: AppShellProps) {
   return (
@@ -38,8 +42,10 @@ export function AppShell({
           onSelect={onSelect}
           onAdd={onAdd}
           onRefresh={onRefresh}
+          showPlugins={showPlugins}
+          onNavigatePlugins={onNavigatePlugins}
         />
-        <main className="flex-1 min-w-0 overflow-y-auto">{children}</main>
+        <main className="flex-1 min-w-0 overflow-hidden flex flex-col">{children}</main>
       </div>
     </div>
   );

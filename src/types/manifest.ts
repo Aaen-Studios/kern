@@ -1,0 +1,60 @@
+/**
+ * Plugin manifest types.
+ * Spec: documentation/ArchitecturePlan.md §3 (Plugin Manifest Specification).
+ * Mirrors the Rust structs in src-tauri/src/manifest.rs (camelCase on wire).
+ */
+
+/** One configurable field in the manifest's configSchema. */
+export interface SchemaField {
+  key: string;
+  label: string;
+  /** "text" | "select" | (future) others. */
+  type: "text" | "select";
+  options?: string[];
+  default: string;
+  /** Optional: this field's default is derived from another field's value. */
+  dependsOn?: DependsOn;
+}
+
+/** Declares that a field's default follows the value of another field. */
+export interface DependsOn {
+  /** The key of the field this one depends on (e.g. "runtime"). */
+  field: string;
+  /** Map of the dependency's value → this field's default. */
+  defaults: Record<string, string>;
+}
+
+/** A single starter file the host writes into a fresh instance directory. */
+export interface ScaffoldFile {
+  /** Relative path inside the instance dir. May use {{userOverrides.*}}. */
+  path: string;
+  /** File contents. May use {{userOverrides.*}} templates. */
+  content: string;
+  /** Only write when the override `field` equals one of `values`. */
+  when?: { field: string; values: string[] };
+}
+
+/** A single lifecycle step: command + args, possibly templated. */
+export interface LifecycleStep {
+  command: string;
+  args: string[];
+}
+
+/** Map of lifecycle step name → step (install / start / stop ...). */
+export type LifecycleMap = Record<string, LifecycleStep>;
+
+/** A plugin manifest.json document. */
+export interface Manifest {
+  id: string;
+  displayName: string;
+  version: string;
+  author: string;
+  /** Path to the compiled ESM frontend bundle, relative to the manifest. */
+  uiEntry?: string;
+  /** Configuration fields surfaced to the host for dynamic form generation. */
+  configSchema: SchemaField[];
+  /** Named lifecycle commands. */
+  lifecycle: LifecycleMap;
+  /** Starter files written into a fresh instance directory, keyed by label. */
+  scaffold: Record<string, ScaffoldFile>;
+}

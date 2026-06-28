@@ -5,6 +5,8 @@ interface ServerCardProps {
   server: ServerInstance;
   onDelete: (id: string) => void;
   onEdit: (server: ServerInstance) => void;
+  /** Navigate to the detail view for this instance. */
+  onSelect?: (id: string) => void;
 }
 
 /**
@@ -12,26 +14,45 @@ interface ServerCardProps {
  * on the emission-matrix axis. Orphaned instances show a fault banner and the
  * absolute path so the user can locate or restore the missing folder.
  */
-export function ServerCard({ server, onDelete, onEdit }: ServerCardProps) {
+export function ServerCard({ server, onDelete, onEdit, onSelect }: ServerCardProps) {
   const color = statusColor(server);
   const hex = statusHex(color);
+
+  function handleClick() {
+    onSelect?.(server.id);
+  }
 
   return (
     <div className="border border-grid-bounds bg-bg-surface p-4">
       <div className="flex items-start justify-between gap-3">
-        <div className="flex items-center gap-2 min-w-0">
+        <div
+          className="flex items-center gap-2 min-w-0 cursor-pointer"
+          onClick={handleClick}
+          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handleClick(); } }}
+          role="button"
+          tabIndex={0}
+          aria-label={`View details for ${server.name}`}
+        >
           <span
             className="inline-block w-2 h-2 rounded-full shrink-0"
             style={{ backgroundColor: hex, boxShadow: `0 0 6px ${hex}` }}
           />
           <div className="min-w-0">
-            <h2 className="text-sm text-zinc-100 truncate">{server.name}</h2>
+            <h2 className="text-sm text-zinc-100 truncate hover:text-zinc-50 transition-colors">
+              {server.name}
+            </h2>
             <p className="text-[11px] text-zinc-500 font-mono truncate">
               {server.id}
             </p>
           </div>
         </div>
         <div className="flex gap-1">
+          <button
+            onClick={() => onSelect?.(server.id)}
+            className="px-2 py-1 text-[11px] text-zinc-400 border border-grid-bounds hover:border-signal-high hover:text-signal-high transition-colors"
+          >
+            view
+          </button>
           <button
             onClick={() => onEdit(server)}
             className="px-2 py-1 text-[11px] text-zinc-400 border border-grid-bounds hover:border-signal-low hover:text-zinc-200 transition-colors"

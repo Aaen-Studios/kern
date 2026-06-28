@@ -1,0 +1,132 @@
+{
+  "id": "discord_bot",
+  "displayName": "Discord Bot Manager",
+  "version": "1.2.0",
+  "author": "kern/sample",
+  "uiEntry": "dist/index.js",
+  "configSchema": [
+    {
+      "key": "runtime",
+      "label": "Runtime",
+      "type": "select",
+      "options": [
+        "node",
+        "bun",
+        "deno",
+        "rust"
+      ],
+      "default": "node"
+    },
+    {
+      "key": "entry",
+      "label": "Entry file",
+      "type": "text",
+      "default": "index.js",
+      "dependsOn": {
+        "field": "runtime",
+        "defaults": {
+          "node": "index.js",
+          "bun": "index.js",
+          "deno": "index.ts",
+          "rust": "src/main.rs"
+        }
+      }
+    },
+    {
+      "key": "token_env",
+      "label": "Token env var",
+      "type": "text",
+      "default": "DISCORD_TOKEN"
+    }
+  ],
+  "lifecycle": {
+    "install": {
+      "command": "{{userOverrides.runtime}}",
+      "args": [
+        "install"
+      ]
+    },
+    "install.rust": {
+      "command": "cargo",
+      "args": [
+        "build"
+      ]
+    },
+    "start": {
+      "command": "{{userOverrides.runtime}}",
+      "args": [
+        "{{userOverrides.entry}}"
+      ]
+    },
+    "start.rust": {
+      "command": "cargo",
+      "args": [
+        "run"
+      ]
+    }
+  },
+  "scaffold": {
+    "package_json": {
+      "path": "package.json",
+      "when": {
+        "field": "runtime",
+        "values": [
+          "node",
+          "bun"
+        ]
+      },
+      "content": "{\n  \"name\": \"discord-bot\",\n  \"version\": \"1.0.0\",\n  \"private\": true,\n  \"scripts\": {\n    \"start\": \"node index.js\"\n  },\n  \"dependencies\": {\n    \"discord.js\": \"^14.0.0\"\n  }\n}\n"
+    },
+    "deps_json": {
+      "path": "deps.json",
+      "when": {
+        "field": "runtime",
+        "values": [
+          "deno"
+        ]
+      },
+      "content": "{\n  \"tasks\": {\n    \"start\": \"deno run --allow-env --allow-net index.ts\"\n  },\n  \"imports\": {}\n}\n"
+    },
+    "cargo_toml": {
+      "path": "Cargo.toml",
+      "when": {
+        "field": "runtime",
+        "values": [
+          "rust"
+        ]
+      },
+      "content": "[package]\nname = \"discord_bot\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nserenity = { version = \"0.12\", default-features = false, features = [\"client\", \"gateway\", \"rustls_backend\", \"model\"] }\ntokio = { version = \"1\", features = [\"macros\", \"rt-multi-thread\"] }\n"
+    },
+    "index_js": {
+      "path": "index.js",
+      "when": {
+        "field": "runtime",
+        "values": [
+          "node",
+          "bun"
+        ]
+      },
+      "content": "// Discord bot entry — read your token from the environment.\n// The kern host streams this process's stdout/stderr to latest.log.\nconst token = process.env.{{userOverrides.token_env}};\nif (!token) {\n  console.error(`missing {{{userOverrides.token_env}}} environment variable`);\n  process.exit(1);\n}\nconsole.log(\"discord bot starting…\");\n// TODO: connect your client here.\n"
+    },
+    "index_ts": {
+      "path": "index.ts",
+      "when": {
+        "field": "runtime",
+        "values": [
+          "deno"
+        ]
+      },
+      "content": "// Deno Discord bot entry.\nconst token = Deno.env.get(\"{{userOverrides.token_env}}\");\nif (!token) {\n  console.error(`missing {{{userOverrides.token_env}}} environment variable`);\n  Deno.exit(1);\n}\nconsole.log(\"discord bot starting…\");\n"
+    },
+    "main_rs": {
+      "path": "src/main.rs",
+      "when": {
+        "field": "runtime",
+        "values": [
+          "rust"
+        ]
+      },
+      "content": "use serenity::prelude::*;\n\n#[tokio::main]\nasync fn main() {\n    let token = std::env::var(\"{{userOverrides.token_env}}\").expect(\"missing token\");\n    println!(\"discord bot starting…\");\n    // TODO: build and start your serenity client here.\n    let _ = token;\n}\n"
+    }
+  }
+}
