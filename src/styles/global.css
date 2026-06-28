@@ -1,0 +1,70 @@
+@import "tailwindcss";
+
+/*
+ * kern design system — monochromatic dark-room console palette.
+ * Token values sourced from documentation/DesignGuide.md §2.
+ * Referenced as utilities like bg-bg-core, text-signal-high, border-grid-bounds.
+ */
+@theme {
+  --color-bg-core: #050506;
+  --color-bg-surface: #0b0c10;
+  --color-grid-bounds: #161920;
+  --color-signal-high: #4cf5a0;
+  --color-signal-low: #4c525e;
+  --color-warn-vector: #f5a04c;
+  --color-fault-vector: #f54c4c;
+
+  --font-mono: "JetBrains Mono", "Cascadia Code", "Fira Code", ui-monospace,
+    SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    background-color: var(--color-bg-core);
+    color: theme(--color-zinc-300);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.4;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Remove default focus ring styling in favor of outline-only accents */
+  *:focus {
+    outline: none;
+  }
+}
+
+/*
+ * Dotted matrix boundary track — used to separate interface blocks without
+ * solid lines (DesignGuide.md §6.1). Apply via the .matrix-border utility.
+ */
+@utility matrix-border {
+  background-image: radial-gradient(#161920 1px, transparent 1px);
+  background-size: 6px 6px;
+  background-repeat: repeat;
+  background-position: center;
+}
+
+/* Thin custom scrollbars to match the high-density aesthetic */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-grid-bounds);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-signal-low);
+}
