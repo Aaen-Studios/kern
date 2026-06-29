@@ -8,10 +8,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use crate::config::{self, AppConfig, ServerInstance};
 use crate::manifest;
+use crate::metrics::{InstanceMetrics, MetricsState};
 use crate::process;
 use crate::scaffold;
 
@@ -192,6 +193,52 @@ pub fn update_server_status(app_handle: AppHandle, id: String, status: String) -
         config::save_config(&app_handle, &cfg)?;
     }
     Ok(())
+}
+
+/// Returns live CPU/RAM telemetry for a running instance, driven by the
+/// instance's process tree. When the instance isn't running (no tracked PID),
+/// returns a zeroed reading tagged with its persisted/orphaned status so the
+/// radar idles cleanly instead of showing stale load.
+#[tauri::command]
+pub fn get_instance_metrics(
+    app_handle: AppHandle,
+    id: String,
+) -> Result<InstanceMetrics, String> {
+    let cfg = config::load_config(&app_handle)?;
+    let instance = cfg
+        .servers
+        .get(&id)
+        .ok_or_else(|| format!("server '{id}' not found"))?;
+
+    let status = if instance.is_orphaned {
+        "orphaned"
+    } else {
+        instance.status.as_str()
+    };
+
+    // Only sample live load when a process is actually tracked. An "error" or
+    // transient status with no live process still falls through to the idle
+    // reading below, which is the right thing to show.
+    if let Some(pid) = process::pid_for(&app_handle, &id) {
+        let state: tauri::State<'_, MetricsState> = app_handle.state();
+        if let Some(m) = state.instance_metrics(pid, status) {
+            return Ok(m);
+        }
+    }
+
+    Ok(InstanceMetrics {
+        cpu: 0.0,
+        ram: 0.0,
+        status: status.to_string(),
+    })
+}
+
+/// Returns host-wide CPU/RAM telemetry, used by the empty-state radar so the
+/// dashboard pulses with the real machine load even when no instances exist.
+#[tauri::command]
+pub fn get_host_metrics(app_handle: AppHandle) -> Result<InstanceMetrics, String> {
+    let state: tauri::State<'_, MetricsState> = app_handle.state();
+    Ok(state.host_metrics())
 }
 
 /// Locates the manifest for a plugin id under `<app_data>/plugins/<id>/`.

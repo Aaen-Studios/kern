@@ -9,6 +9,7 @@ interface AppShellProps {
   loading: boolean;
   onSelect: (id: string) => void;
   onAdd: () => void;
+  onHome: () => void;
   onRefresh: () => void;
   showPlugins: boolean;
   onNavigatePlugins: () => void;
@@ -26,6 +27,7 @@ export function AppShell({
   loading,
   onSelect,
   onAdd,
+  onHome,
   onRefresh,
   showPlugins,
   onNavigatePlugins,
@@ -33,7 +35,7 @@ export function AppShell({
 }: AppShellProps) {
   return (
     <div className="flex flex-col h-screen overflow-hidden bg-bg-core">
-      <TitleBar />
+      <TitleBar onHome={onHome} />
       <div className="flex flex-1 min-h-0">
         <Sidebar
           servers={servers}

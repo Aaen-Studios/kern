@@ -3,6 +3,7 @@
 mod commands;
 mod config;
 mod manifest;
+mod metrics;
 mod process;
 mod scaffold;
 mod seed;
@@ -17,6 +18,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(process::ProcessRegistry::default())
+        .manage(metrics::MetricsState::default())
         .setup(|app| {
             // Seed sample community plugins from the repo into AppData so the
             // manifest engine can discover them during development.
@@ -53,6 +55,8 @@ pub fn run() {
             commands::launch_server_instance,
             commands::stop_server_instance,
             commands::update_server_status,
+            commands::get_instance_metrics,
+            commands::get_host_metrics,
             commands::run_lifecycle_step,
             commands::install_server_instance,
             commands::restart_server_instance,

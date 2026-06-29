@@ -8,6 +8,7 @@ import { ConfirmDialog } from "./components/ui/ConfirmDialog";
 import { ErrorBoundary } from "./components/ui/ErrorBoundary";
 import { PluginManager } from "./components/plugins/PluginManager";
 import { useServers } from "./hooks/useServers";
+import { useLiveStatus } from "./hooks/useLiveStatus";
 import type { NewServerInput, ServerInstance } from "./types/server";
 
 type View =
@@ -33,19 +34,36 @@ export default function App() {
     reload,
   } = useServers();
 
+  // Overlay live process status onto the persisted list. The sidebar + main
+  // list read persisted status, which only refreshes on explicit reload() and
+  // races the async status:<id> events — so without this overlay they'd sit on
+  // "stopped" while a process is actually running. Live status wins except when
+  // an instance is orphaned (a dead path can't hide behind stale "running").
+  const ids = useMemo(() => servers.map((s) => s.id), [servers]);
+  const { liveStatus } = useLiveStatus(ids);
+  const serversLive = useMemo(
+    () =>
+      servers.map((s) =>
+        s.isOrphaned || liveStatus[s.id] == null
+          ? s
+          : { ...s, status: liveStatus[s.id] },
+      ),
+    [servers, liveStatus],
+  );
+
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>({ kind: "list" });
 
   // Confirmation dialog state — tracks the instance id pending deletion.
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const pendingDelete = useMemo(
-    () => servers.find((s) => s.id === pendingDeleteId) ?? null,
-    [servers, pendingDeleteId],
+    () => serversLive.find((s) => s.id === pendingDeleteId) ?? null,
+    [serversLive, pendingDeleteId],
   );
 
   const selected = useMemo(
-    () => servers.find((s) => s.id === selectedId) ?? null,
-    [servers, selectedId],
+    () => serversLive.find((s) => s.id === selectedId) ?? null,
+    [serversLive, selectedId],
   );
 
   function handleSelect(id: string) {
@@ -121,11 +139,12 @@ export default function App() {
 
   return (
     <AppShell
-      servers={servers}
+      servers={serversLive}
       selectedId={selectedId}
       loading={loading}
       onSelect={handleSelect}
       onAdd={() => setView({ kind: "create" })}
+      onHome={() => setView({ kind: "list" })}
       onRefresh={refreshOrphaned}
       showPlugins={view.kind === "plugins"}
       onNavigatePlugins={() => setView({ kind: "plugins" })}
@@ -155,7 +174,7 @@ export default function App() {
             {view.kind === "list" && (
               <ServerList
                 key="list"
-                servers={servers}
+                servers={serversLive}
                 onDelete={handleDelete}
                 onEdit={handleEdit}
                 onAdd={() => setView({ kind: "create" })}

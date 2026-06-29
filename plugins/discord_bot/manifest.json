@@ -126,7 +126,7 @@
           "rust"
         ]
       },
-      "content": "use serenity::prelude::*;\n\n#[tokio::main]\nasync fn main() {\n    let token = std::env::var(\"{{userOverrides.token_env}}\").expect(\"missing token\");\n    println!(\"discord bot starting…\");\n    // TODO: build and start your serenity client here.\n    let _ = token;\n}\n"
+      "content": "use serenity::prelude::*;\n\n#[tokio::main]\nasync fn main() {\n    // Read the bot token from the DISCORD_TOKEN env var. Set it in a .env\n    // file in this folder (the kern host injects .env into the process).\n    let token = std::env::var(\"DISCORD_TOKEN\").expect(\"missing DISCORD_TOKEN env var — add it to .env\");\n    println!(\"discord bot starting…\");\n    // TODO: build and start your serenity client here.\n    let _ = token;\n}\n"
     }
   }
 }

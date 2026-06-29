@@ -29,6 +29,12 @@ export interface ShaderTelemetry {
   ram: number;
   /** Raw status string passed from the Tauri core. */
   status: string;
+  /**
+   * Recent output churn (0.0..1.0+): how fast log lines have been arriving.
+   * 0 = idle/silent, 1+ = a busy stream. Optional because host-wide metrics
+   * have no associated log stream; shaders that use it should default to 0.
+   */
+  activity?: number;
 }
 
 /** Runtime context handed to every shader invocation. */

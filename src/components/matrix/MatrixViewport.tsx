@@ -17,6 +17,10 @@ interface ViewportProps {
   throttleMs?: number;
   /** Optional className to control sizing/positioning of the wrapper. */
   className?: string;
+  /** Stretch the grid to fill its container's width and distribute dots
+   * evenly across it. Off by default (the viewport is content-sized); used by
+   * the fluid `MatrixBar` so dots span the full gap rather than hugging left. */
+  fluid?: boolean;
 }
 
 /**
@@ -44,6 +48,7 @@ export function MatrixViewport({
   telemetry,
   throttleMs = 50,
   className,
+  fluid = false,
 }: ViewportProps) {
   const [buffer, setBuffer] = useState<MatrixBuffer>(() =>
     shader({ tick: 0, cols, rows, telemetry }),
@@ -82,7 +87,9 @@ export function MatrixViewport({
 
   return (
     <div
-      className={`grid gap-[3px] bg-bg-core border border-grid-bounds p-1.5 ${className ?? ""}`}
+      className={`grid gap-[3px] bg-bg-core border border-grid-bounds p-1.5 ${
+        fluid ? "w-full justify-items-center" : ""
+      } ${className ?? ""}`}
       style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}
     >
       {buffer.map((node, idx) => {

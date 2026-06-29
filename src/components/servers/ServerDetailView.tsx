@@ -3,9 +3,13 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ServerInstance } from "../../types/server";
 import { useServerControl } from "../../hooks/useServerControl";
 import { usePlugins } from "../../hooks/usePlugins";
+import { useMetrics } from "../../hooks/useMetrics";
+import { useLogActivity } from "../../hooks/useLogActivity";
 import { statusHex } from "./status";
 import { parseAnsi, DEFAULT_FG } from "./ansi";
 import { PluginWrapper } from "../plugins/PluginWrapper";
+import { MatrixBar } from "../matrix/MatrixBar";
+import { reactorChannelShader } from "../matrix/shaders/reactorChannel";
 
 interface ServerDetailViewProps {
   server: ServerInstance;
@@ -33,6 +37,11 @@ export function ServerDetailView({
   const { logs, running, launching, busy, launch, stop, install, restart, error, pushLine } =
     useServerControl(server.id, onStatusChange);
   const { byId } = usePlugins();
+  // Live process-tree telemetry drives the header reactor bar. When the instance
+  // isn't running the backend returns a zeroed reading, so the bar idles cleanly.
+  const metrics = useMetrics(server.id);
+  // Log churn feeds the bar's activity lane so output bursts visibly flare.
+  const activity = useLogActivity(server.id);
   const terminalRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -71,7 +80,7 @@ export function ServerDetailView({
     let cancelled = false;
     invoke<boolean>("server_file_exists", { id: server.id, relPath: ".installed" })
       .then((exists) => { if (!cancelled) setInstalled(exists); })
-      .catch(() => {});
+      .catch(() => { });
     return () => { cancelled = true; };
   }, [server.id]);
 
@@ -263,14 +272,10 @@ export function ServerDetailView({
           <div className="flex items-center gap-2 min-w-0">
             <button
               onClick={onBack}
-              className="text-[11px] text-zinc-500 hover:text-zinc-200 transition-colors mr-1"
+              className="text-[18px] text-zinc-500 hover:text-zinc-200 transition-colors mr-1"
             >
               ←
             </button>
-            <span
-              className="inline-block w-2 h-2 rounded-full shrink-0"
-              style={{ backgroundColor: liveHex, boxShadow: `0 0 6px ${liveHex}` }}
-            />
             <div className="min-w-0">
               <h2 className="text-sm text-zinc-100 truncate">{server.name}</h2>
               <p className="text-[11px] text-zinc-500 font-mono truncate">
@@ -279,7 +284,42 @@ export function ServerDetailView({
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          {/* Reactor channel — a fluid-width matrix strip filling the space
+              between the instance name and the lifecycle buttons. Layers CPU
+              shimmer, RAM fill, and log-activity comet pulses into one bar. */}
+          <div className="flex-1 min-w-0 flex flex-col gap-1 px-2">
+            <div className="flex items-center justify-between font-mono text-[9px] uppercase tracking-wider text-zinc-600 tabular-nums">
+              <span className="flex items-center gap-3">
+                <span>
+                  cpu{" "}
+                  <span className={metrics.cpu > 0.9 ? "text-fault-vector" : "text-zinc-400"}>
+                    {(metrics.cpu * 100).toFixed(0)}%
+                  </span>
+                </span>
+                <span>
+                  ram{" "}
+                  <span className={metrics.ram > 0.85 ? "text-fault-vector" : "text-zinc-400"}>
+                    {(metrics.ram * 100).toFixed(0)}%
+                  </span>
+                </span>
+                <span>
+                  log{" "}
+                  <span className={activity > 1 ? "text-signal-high" : "text-zinc-400"}>
+                    {activity.toFixed(1)}×
+                  </span>
+                </span>
+              </span>
+              <span className="opacity-60">reactor</span>
+            </div>
+            <MatrixBar
+              shader={reactorChannelShader}
+              telemetry={{ ...metrics, status: liveStatus, activity }}
+              rows={2}
+              pitchPx={6}
+            />
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
             <span
               className="text-[11px] font-mono px-3 py-1.5 border"
               style={{ color: liveHex, borderColor: `${liveHex}55` }}

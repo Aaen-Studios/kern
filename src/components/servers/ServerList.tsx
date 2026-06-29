@@ -2,6 +2,7 @@ import type { ServerInstance } from "../../types/server";
 import { ServerCard } from "./ServerCard";
 import { MatrixViewport } from "../matrix/MatrixViewport";
 import { polarRadarShader } from "../matrix/shaders/polarRadar";
+import { useHostMetrics } from "../../hooks/useMetrics";
 import type { DotColor } from "../../types/matrix";
 
 interface ServerListProps {
@@ -33,6 +34,11 @@ const DOT_HEX: Record<DotColor, string> = {
  * host is never visually idle — the sweep pulses even with no instances.
  */
 export function ServerList({ servers, onDelete, onEdit, onAdd, onSelect }: ServerListProps) {
+  // Live host telemetry drives the empty-state radar so the dashboard pulses
+  // with real machine load. Hook runs unconditionally (React rules) even though
+  // the radar only renders in the empty state below.
+  const hostTelemetry = useHostMetrics();
+
   if (servers.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center h-full gap-6 p-8">
@@ -40,7 +46,7 @@ export function ServerList({ servers, onDelete, onEdit, onAdd, onSelect }: Serve
           cols={11}
           rows={11}
           shader={polarRadarShader}
-          telemetry={{ cpu: 0.1, ram: 0.18, status: "idle" }}
+          telemetry={hostTelemetry}
         />
         <div className="text-center">
           <p className="text-sm text-zinc-300">no server instances registered</p>

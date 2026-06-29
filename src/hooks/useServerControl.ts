@@ -88,7 +88,10 @@ export function useServerControl(
           invoke<boolean>("is_server_running", { id: serverId }),
         ]);
         if (cancelled) return;
-        setLogs(tail);
+        // Merge the historical tail *before* any line that already streamed in
+        // while this async load was in flight — a plain setLogs(tail) would
+        // clobber a live line that beat the seed.
+        setLogs((prev) => (prev.length ? [...tail, ...prev] : tail));
         setRunning(isRunning);
       } catch (e) {
         if (!cancelled) setError(String(e));
@@ -112,36 +115,62 @@ export function useServerControl(
   useEffect(() => {
     if (!serverId) return;
     const gen = ++subscriptionGen;
+    // Track whether this effect cycle was cleaned up before its async listen()
+    // calls resolved. Under React StrictMode the effect fires twice on mount;
+    // without this guard the first cycle's listeners attach *after* its own
+    // cleanup ran, so they'd never be unlistened and would leak (silently, but
+    // still). If we detect that, we drop the just-resolved listener right away.
+    let disposed = false;
     let unlistenLog: UnlistenFn | undefined;
     let unlistenStatus: UnlistenFn | undefined;
 
     (async () => {
-      unlistenLog = await listen<string>(`log:${serverId}:stream`, (event) => {
-        // Ignore events from a subscription a newer effect cycle has superseded.
-        if (subscriptionGen !== gen) return;
-        setLogs((prev) => {
-          const next = [...prev, event.payload];
-          return next.length > MAX_LINES ? next.slice(next.length - MAX_LINES) : next;
+      try {
+        const logUnlisten = await listen<string>(`log:${serverId}:stream`, (event) => {
+          // Ignore events from a subscription a newer effect cycle has superseded.
+          if (subscriptionGen !== gen) return;
+          setLogs((prev) => {
+            const next = [...prev, event.payload];
+            return next.length > MAX_LINES ? next.slice(next.length - MAX_LINES) : next;
+          });
         });
-      });
-      unlistenStatus = await listen<StatusPayload>(`status:${serverId}`, (event) => {
-        if (subscriptionGen !== gen) return;
-        const payload = event.payload;
-        if (payload.state === "running") {
-          setRunning(true);
-          setBusy(false);
-        } else {
-          // exited — sync persisted status so the sidebar matches reality.
-          setRunning(false);
-          setBusy(false);
-          const newStatus = payload.code != null && payload.code !== 0 ? "error" : "stopped";
-          void invoke("update_server_status", { id: serverId, status: newStatus });
+        if (disposed) {
+          // Effect already cleaned up before this listener resolved — detach it.
+          logUnlisten();
+          return;
         }
-        onChangeRef.current?.();
-      });
+        unlistenLog = logUnlisten;
+
+        const statusUnlisten = await listen<StatusPayload>(`status:${serverId}`, (event) => {
+          if (subscriptionGen !== gen) return;
+          const payload = event.payload;
+          if (payload.state === "running") {
+            setRunning(true);
+            setBusy(false);
+          } else {
+            // exited — sync persisted status so the sidebar matches reality.
+            setRunning(false);
+            setBusy(false);
+            const newStatus = payload.code != null && payload.code !== 0 ? "error" : "stopped";
+            void invoke("update_server_status", { id: serverId, status: newStatus });
+          }
+          onChangeRef.current?.();
+        });
+        if (disposed) {
+          statusUnlisten();
+          return;
+        }
+        unlistenStatus = statusUnlisten;
+      } catch (e) {
+        // A listener failure would otherwise die as an unhandled rejection and
+        // streaming would silently stop forever. Surface it instead.
+        console.error("[useServerControl] failed to attach stream listeners:", e);
+        setError(`Failed to subscribe to live output: ${String(e)}`);
+      }
     })();
 
     return () => {
+      disposed = true;
       unlistenLog?.();
       unlistenStatus?.();
     };

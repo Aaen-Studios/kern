@@ -50,7 +50,7 @@ export function PluginManager({ onBack }: PluginManagerProps) {
           <div className="flex items-center gap-2 min-w-0">
             <button
               onClick={onBack}
-              className="text-[11px] text-zinc-500 hover:text-zinc-200 transition-colors mr-1"
+              className="text-[18px] text-zinc-500 hover:text-zinc-200 transition-colors mr-1"
             >
               ←
             </button>
