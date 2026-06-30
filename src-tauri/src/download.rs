@@ -266,6 +266,37 @@ fn fetch_forge_versions() -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// Resolves the recommended Forge version for a given Minecraft version.
+///
+/// Runs server-side (so no CORS) by fetching the same `promotions_slim.json`
+/// the plugin's `resolveForgeVersion()` hits from the webview. The webview
+/// call is CORS-blocked and has no fallback, so it always throws and Forge
+/// installs abort; the plugin now falls back to this command on failure, the
+/// same pattern `fetch_mc_versions` already uses for version *listing*.
+///
+/// Returns `Ok(None)` (not an error) when no recommended build exists for the
+/// given MC version, so the installer can surface a clean "no Forge version"
+/// message instead of a generic network error.
+#[tauri::command]
+pub fn resolve_forge_version(mc_version: String) -> Result<Option<String>, String> {
+    let data =
+        get_json("https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json")?;
+    let promos = data["promos"]
+        .as_object()
+        .ok_or_else(|| "invalid forge manifest: missing 'promos'".to_string())?;
+
+    // Prefer "<mcVersion>-recommended"; fall back to "<mcVersion>-latest".
+    let recommended_key = format!("{mc_version}-recommended");
+    if let Some(v) = promos.get(&recommended_key).and_then(|v| v.as_str()) {
+        return Ok(Some(v.to_string()));
+    }
+    let latest_key = format!("{mc_version}-latest");
+    if let Some(v) = promos.get(&latest_key).and_then(|v| v.as_str()) {
+        return Ok(Some(v.to_string()));
+    }
+    Ok(None)
+}
+
 fn fetch_neoforge_versions() -> Result<Vec<String>, String> {
     // NeoForge's old meta API (api.neoforged.net) no longer resolves. Use the
     // Maven versions endpoint, which lists build names like "20.2.3-beta" or

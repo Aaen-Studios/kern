@@ -24,6 +24,10 @@ export async function runInstall(
   runtime: string,
   mcVersion: string,
   javaPath: string,
+  acceptEula: boolean,
+  /** The user's jvm_args override, used to seed user_jvm_args.txt for
+   *  Forge/NeoForge (whose generated run scripts read it via @user_jvm_args.txt). */
+  jvmArgsOverride: string | undefined,
   hostAPI: HostAPI,
   cb: InstallCallbacks,
 ): Promise<void> {
@@ -37,16 +41,30 @@ export async function runInstall(
     return idx;
   }
 
-  function setStep(idx: number, status: InstallStep["status"], message?: string) {
-    steps[idx] = { ...steps[idx], status, message };
+  function setStep(
+    idx: number,
+    status: InstallStep["status"],
+    message?: string,
+    downloadPct?: number,
+  ) {
+    steps[idx] = { ...steps[idx], status, message, downloadPct };
     cb.onStepUpdate([...steps]);
   }
 
   async function download(url: string, dest: string, stepIdx: number): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      downloadWithProgress(url, dest, hostAPI.invoke, {
+      downloadWithProgress(url, dest, hostAPI.invoke, hostAPI.listen, {
+        onProgress(bytes, total) {
+          if (total > 0) {
+            const pct = Math.round((bytes / total) * 100);
+            // Carry the percentage on the step itself so the progress bar in
+            // renderInstallSection() reads from THIS download, not the
+            // unrelated Java-download gauge (state.downloadProgress).
+            setStep(stepIdx, "running", `${pct}%`, pct);
+          }
+        },
         onComplete() {
-          setStep(stepIdx, "done", "downloaded");
+          setStep(stepIdx, "done", "downloaded", 100);
           resolve();
         },
         onError(err) {
@@ -87,10 +105,54 @@ export async function runInstall(
     });
   }
 
+  /** Returns true when running on Windows. The host runs the lifecycle step
+   *  through the OS shell (sh on Unix, cmd.exe on Windows — see process.rs
+   *  build_shell_command), so the launcher script we write must match the
+   *  platform the server actually runs on. */
+  function isWindows(): boolean {
+    return typeof navigator !== "undefined"
+      ? /Win/i.test(navigator.platform || navigator.userAgent)
+      : false;
+  }
+
+  /** Writes user_jvm_args.txt with the user's heap/GC flags derived from the
+   *  jvm_args override. Forge/NeoForge's generated run scripts read this via
+   *  `@user_jvm_args.txt`, so without it the server launches with default
+   *  memory (or fails outright if a script requires it). */
+  async function writeUserJvmArgs(jvmArgs?: string): Promise<void> {
+    const args = (jvmArgs ?? "-Xms2G -Xmx2G").trim();
+    await writeFile("user_jvm_args.txt", args + "\n");
+  }
+
+  /** Writes a cross-platform launcher script that runs the OS-appropriate
+   *  `run.sh` / `run.bat` the Forge/NeoForge installer generated. The manifest
+   *  invokes this script with useShell=true; build_shell_command (host-side)
+   *  picks the matching shell, and this script picks the matching run script,
+   *  so the same manifest step works on both platforms. */
+  async function writeModloaderLauncher(): Promise<void> {
+    if (isWindows()) {
+      // cmd.exe: call the generated run.bat, passing through any args (nogui).
+      await writeFile("kern_start.bat", "@echo off\r\ncall run.bat %*\r\n");
+    } else {
+      // sh: exec the generated run.sh, passing through args.
+      await writeFile("kern_start.sh", "#!/usr/bin/env sh\nexec sh run.sh \"$@\"\n");
+    }
+  }
+
   // -----------------------------------------------------------------------
   //  Common: accept EULA
+  //
+  //  Honor the accept_eula override rather than unconditionally writing
+  //  eula=true. The manifest scaffold already templates eula.txt from the
+  //  same override, so the two paths now agree. If the user hasn't accepted,
+  //  abort with a clear message instead of silently binding them to the EULA.
   // -----------------------------------------------------------------------
   const eulaStep = addStep("Accept EULA");
+  if (!acceptEula) {
+    setStep(eulaStep, "error", "not accepted");
+    cb.onComplete(false, "EULA not accepted. Enable \"Accept EULA\" in the server's settings before installing.");
+    return;
+  }
   try {
     setStep(eulaStep, "running");
     await writeFile("eula.txt", "eula=true\n");
@@ -172,7 +234,7 @@ export async function runInstall(
       case "forge": {
         const resolveStep = addStep("Resolve Forge version");
         setStep(resolveStep, "running");
-        const forgeVer = await resolveForgeVersion(mcVersion);
+        const forgeVer = await resolveForgeVersion(mcVersion, hostAPI.invoke);
         if (!forgeVer) {
           setStep(resolveStep, "error", `No Forge version for MC ${mcVersion}`);
           cb.onComplete(false, `Could not resolve Forge version for ${mcVersion}`);
@@ -186,7 +248,18 @@ export async function runInstall(
         await download(installerUrl, installerJar, dlStep);
 
         const runStep = addStep("Run Forge installer");
+        // Forge's --installServer generates libraries/, user_jvm_args.txt
+        // template, and run.sh/run.bat — but NO server.jar. Starting it needs
+        // those generated scripts, so after install we seed user_jvm_args.txt
+        // (heap from the override) and a cross-platform launcher the manifest
+        // invokes via useShell. See manifest.json start.forge.
         await runCmd(["-jar", "forge-installer.jar", "--installServer"], runStep);
+
+        const cfgArgsStep = addStep("Write launch config");
+        setStep(cfgArgsStep, "running");
+        await writeUserJvmArgs(jvmArgsOverride);
+        await writeModloaderLauncher();
+        setStep(cfgArgsStep, "done");
         break;
       }
 
@@ -207,7 +280,15 @@ export async function runInstall(
         await download(installerUrl, installerJar, dlStep);
 
         const runStep = addStep("Run NeoForge installer");
+        // Like Forge, --install-server generates libraries/ + run scripts, not a
+        // server.jar. Seed user_jvm_args.txt + a launcher (see start.neoforge).
         await runCmd(["-jar", "neoforge-installer.jar", "--install-server"], runStep);
+
+        const cfgArgsStep = addStep("Write launch config");
+        setStep(cfgArgsStep, "running");
+        await writeUserJvmArgs(jvmArgsOverride);
+        await writeModloaderLauncher();
+        setStep(cfgArgsStep, "done");
         break;
       }
 
@@ -245,7 +326,11 @@ export async function runInstall(
     return;
   }
 
-  // Write server.properties with port from overrides
+  // Write a minimal server.properties seed. The server generates the full
+  // default set on first run, so seeding just the port (read from the instance
+  // .env, which create_server materializes from the user's server_port
+  // override — falling back to 25565) avoids clobbering defaults and won't
+  // disagree with whatever the user picks later in the Manage tab.
   const cfgStep = addStep("Write server.properties");
   try {
     setStep(cfgStep, "running");
@@ -257,20 +342,12 @@ export async function runInstall(
         return match ? match[1] : "25565";
       })
       .catch(() => "25565");
-
     await writeFile(
       "server.properties",
       [
         "# Minecraft server properties",
-        "# Auto-generated by Kern minecraft_java plugin",
+        "# Seeded by Kern minecraft_java plugin — the server fills in the rest on first run.",
         `server-port=${port}`,
-        "motd=A Minecraft Server",
-        "gamemode=survival",
-        "difficulty=easy",
-        "max-players=20",
-        "online-mode=true",
-        "allow-flight=false",
-        "white-list=false",
       ].join("\n") + "\n",
     );
     setStep(cfgStep, "done");
@@ -279,7 +356,7 @@ export async function runInstall(
     cb.onLog(`WARN: failed to write server.properties: ${e}`);
   }
 
-  cb.onLog("✅  Install complete!");
+  cb.onLog("[ok]  Install complete!");
   cb.onComplete(true, "Server installed successfully. You can now start it.");
 }
 

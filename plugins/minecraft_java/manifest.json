@@ -108,23 +108,18 @@
       ]
     },
     "start.forge": {
-      "command": "{{userOverrides.java_path}}",
+      "command": "kern_start",
       "args": [
-        "{{userOverrides.jvm_args}}",
-        "@user_jvm_args.txt",
-        "-jar",
-        "server.jar",
-        "--nogui"
-      ]
+        "nogui"
+      ],
+      "useShell": true
     },
     "start.neoforge": {
-      "command": "{{userOverrides.java_path}}",
+      "command": "kern_start",
       "args": [
-        "{{userOverrides.jvm_args}}",
-        "-jar",
-        "server.jar",
-        "--nogui"
-      ]
+        "nogui"
+      ],
+      "useShell": true
     }
   },
   "tabs": [

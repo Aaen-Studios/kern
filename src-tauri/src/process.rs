@@ -282,6 +282,68 @@ pub fn shell_split(input: &str) -> Vec<String> {
     input.split_whitespace().map(String::from).collect()
 }
 
+/// Builds a `Command` that runs `command` (with `args`) through the OS shell.
+///
+/// Used for lifecycle steps whose `command` names a script (Forge/NeoForge's
+/// generated `run.sh` / `run.bat`), which can't be spawned directly. On Unix we
+/// invoke `sh -c "<command> <quoted args…>"`; on Windows `cmd.exe /C "<command>
+/// <args…>"`.
+///
+/// A platform-agnostic launcher name (a bare word like `kern_start`, written by
+/// a plugin's installer as `kern_start.sh` on Unix or `kern_start.bat` on
+/// Windows) is resolved to the matching extension for the host OS, so a single
+/// manifest step works cross-platform.
+fn build_shell_command(command: &str, args: &[String]) -> Command {
+    // Resolve a bare launcher name (no path separator, no extension) to the
+    // OS-appropriate script. Names that already carry an extension or a path
+    // are passed through untouched.
+    let resolved = if !command.contains('.') && !command.contains('/') && !command.contains('\\') {
+        if cfg!(windows) {
+            format!("{command}.bat")
+        } else {
+            format!("{command}.sh")
+        }
+    } else {
+        command.to_string()
+    };
+
+    if cfg!(windows) {
+        // cmd.exe /C passes the whole line verbatim to the shell; no extra
+        // quoting needed since cmd's own parser handles flags fine.
+        let mut line = resolved;
+        for a in args {
+            line.push(' ');
+            line.push_str(a);
+        }
+        let mut c = Command::new("cmd.exe");
+        c.arg("/C").arg(line);
+        c
+    } else {
+        // sh -c "<command> 'arg1' 'arg2' …" — single-quote each arg so a value
+        // containing spaces survives intact. (Lifecycle args here are simple
+        // flags like "nogui", so this is belt-and-braces.) For a bare launcher
+        // name (no path separator) — whether the caller wrote "kern_start" or
+        // we resolved it to "kern_start.sh" — prefix "./" so sh finds it in the
+        // working directory (the cwd isn't normally on $PATH).
+        let mut line = if !resolved.contains('/') && !resolved.contains('\\') {
+            format!("./{resolved}")
+        } else {
+            resolved
+        };
+        for a in args {
+            line.push(' ');
+            // Escape any embedded single-quote per the standard ''-wrap rule.
+            let safe = a.replace('\'', "'\\''");
+            line.push('\'');
+            line.push_str(&safe);
+            line.push('\'');
+        }
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(line);
+        c
+    }
+}
+
 /// Spawns a server instance's "start" lifecycle step with piped stdio.
 ///
 /// `working_dir` is where the process runs and where `latest.log` is written.
@@ -290,12 +352,20 @@ pub fn shell_split(input: &str) -> Vec<String> {
 /// registered, its stdout+stderr are streamed line-by-line over
 /// `log:<id>:stream`, and a `Running` status is emitted. When it exits, an
 /// `Exited` status is emitted.
+///
+/// When `use_shell` is true the command is invoked through the OS shell
+/// (`sh -c` on Unix, `cmd.exe /C` on Windows) so lifecycle steps that name a
+/// script (e.g. Forge/NeoForge's generated `run.sh` / `run.bat`) can be run,
+/// which `Command::new` can't do directly. The `command` string is passed to
+/// the shell as-is; `args` are appended after it (shell-quoted on Unix so a
+/// flag with spaces survives).
 pub fn launch(
     app_handle: &AppHandle,
     instance_id: &str,
     working_dir: &Path,
     command: &str,
     args: &[String],
+    use_shell: bool,
 ) -> Result<(), String> {
     // 0. Start fresh: truncate latest.log so the seeded tail reflects only this
     //    run, not the previous run's `[process terminated …]` marker.
@@ -307,9 +377,14 @@ pub fn launch(
     // 1. Build the command. std::process::Command inherits the host environment
     //    by default (so PATH etc. are preserved); layer the instance's .env on
     //    top. Pipes on all three streams so we can read output and feed stdin.
-    let mut cmd = Command::new(command);
+    let mut cmd = if use_shell {
+        build_shell_command(command, args)
+    } else {
+        let mut c = Command::new(command);
+        c.args(args);
+        c
+    };
     cmd.current_dir(working_dir);
-    cmd.args(args);
     let env_path = working_dir.join(".env");
     for (k, v) in parse_env_file(&env_path) {
         cmd.env(k, v);
@@ -492,6 +567,15 @@ fn forward_line(
 
 /// Terminates a running instance by id. Returns Ok even if not running, so the
 /// UI can treat stop as idempotent.
+///
+/// This is a hard, immediate kill. For a graceful shutdown (e.g. letting a
+/// Minecraft server flush its world to disk before exiting) use
+/// [`stop_graceful`], which prefers a polite exit and only falls back to a hard
+/// kill on timeout.
+///
+/// Not currently called from any command (both the stop and restart paths use
+/// `stop_graceful`), but kept as the documented hard-kill primitive.
+#[allow(dead_code)]
 pub fn stop(app_handle: &AppHandle, instance_id: &str) -> Result<(), String> {
     let registry: tauri::State<'_, ProcessRegistry> = app_handle.state();
     let removed = {
@@ -506,6 +590,118 @@ pub fn stop(app_handle: &AppHandle, instance_id: &str) -> Result<(), String> {
         // and exits. We don't wait here (the reader thread owns teardown); a
         // kill without a following wait just orphans the child, which the OS
         // reaps, but to be tidy try to take the child and kill+wait it.
+        let mut child = proc.child.into_inner().expect("child lock poisoned");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    Ok(())
+}
+
+/// Gracefully shuts down a running instance by id.
+///
+/// Writes `stop` to the child's stdin and waits for it to exit on its own. For a
+/// Minecraft server this triggers a clean shutdown: it flushes chunks, saves the
+/// world, and exits — so the next start doesn't roll back to the last autosave.
+///
+/// If the child hasn't exited within `timeout`, we fall back to a hard `kill()`
+/// so a hung or unresponsive process can't wedge the stop button forever. Either
+/// way the registry entry is removed and the result is `Ok` — stop stays
+/// idempotent and always succeeds from the caller's perspective.
+///
+/// Unlike [`stop`], the entry is left in the registry during the wait so the
+/// stdout reader thread owns the normal EOF teardown path (it emits the
+/// `Exited` status + `[process terminated]` marker, which the UI uses to sync
+/// the sidebar status). We only remove the entry ourselves on the timeout path.
+pub fn stop_graceful(
+    app_handle: &AppHandle,
+    instance_id: &str,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let registry: tauri::State<'_, ProcessRegistry> = app_handle.state();
+
+    // 1. Send the polite shutdown command. We hold the stdin lock only for the
+    //    write, then drop it immediately so the reader threads (and any pending
+    //    console input) aren't blocked.
+    {
+        let mut map = registry
+            .processes
+            .lock()
+            .map_err(|e| format!("process registry lock poisoned: {e}"))?;
+        let proc = match map.get_mut(instance_id) {
+            Some(p) => p,
+            None => return Ok(()), // not running — idempotent, like stop()
+        };
+        let mut guard = proc
+            .stdin
+            .lock()
+            .map_err(|e| format!("stdin lock poisoned: {e}"))?;
+        if let Some(stdin) = guard.as_mut() {
+            // "stop" is the canonical graceful-shutdown command for vanilla /
+            // Bukkit / Paper / Forge / Fabric servers. The trailing newline
+            // submits it to the server's command console.
+            if let Err(e) = stdin.write_all(b"stop\n") {
+                // A closed stdin means the child is already tearing itself down
+                // (or never had one) — fall through to the wait; the timeout +
+                // kill fallback still guarantees we don't hang.
+                eprintln!("[process] graceful stop: stdin write failed ({e}) — waiting for exit");
+            }
+            let _ = stdin.flush();
+        }
+    }
+
+    // 2. Wait for the child to exit on its own. We poll the exit status (which
+    //    reaps a zombie without blocking) on a short cadence until either it has
+    //    exited or we hit the timeout. Polling — rather than `child.wait()` on
+    //    the locked handle — keeps the lock uncontended: the stdout reader
+    //    thread needs the same handle for its teardown `wait()`, and holding it
+    //    for the whole timeout would deadlock that path.
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        // try_wait needs the child lock, so only hold it for the probe itself.
+        let exited = {
+            let map = registry
+                .processes
+                .lock()
+                .map_err(|e| format!("process registry lock poisoned: {e}"))?;
+            match map.get(instance_id) {
+                Some(proc) => {
+                    let mut child = proc
+                        .child
+                        .lock()
+                        .map_err(|e| format!("child lock poisoned: {e}"))?;
+                    match child.try_wait() {
+                        Ok(Some(_)) => true,  // exited
+                        Ok(None) => false,    // still running
+                        Err(_) => true,       // couldn't query — treat as gone
+                    }
+                }
+                None => return Ok(()), // already torn down by the reader thread
+            }
+        };
+        if exited {
+            // The child is gone; the stdout reader thread will (or already has)
+            // run the normal gen-guarded teardown — emit Exited + marker. We
+            // don't touch the entry so `still_mine` stays true.
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // 3. Timed out — the process didn't heed `stop`. Force it so the stop
+    //    button can never hang. This is the same path as stop(): remove the
+    //    entry (so the reader thread's `still_mine` check fails and it stays
+    //    silent), then kill + wait.
+    let removed = {
+        let mut map = registry
+            .processes
+            .lock()
+            .map_err(|e| format!("process registry lock poisoned: {e}"))?;
+        map.remove(instance_id)
+    };
+    if let Some(proc) = removed {
         let mut child = proc.child.into_inner().expect("child lock poisoned");
         let _ = child.kill();
         let _ = child.wait();

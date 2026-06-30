@@ -181,12 +181,22 @@ export async function fetchForgeVersions(): Promise<
 
 export async function resolveForgeVersion(
   mcVersion: string,
+  invoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>,
 ): Promise<string | null> {
-  const entries = await fetchForgeVersions();
-  const recommended = entries.find(
-    (e) => e.mcVersion === mcVersion,
-  );
-  return recommended?.forgeVersion ?? null;
+  // The direct browser fetch of promotions_slim.json is CORS-blocked (the file
+  // sends no CORS headers — see fetchForgeVersions). Unlike version *listing*,
+  // this resolve path previously had no try/catch and no fallback, so any Forge
+  // install aborted. Mirror fetchVersionsForRuntime: try direct, fall back to
+  // the Rust resolve_forge_version proxy on failure.
+  try {
+    const entries = await fetchForgeVersions();
+    const recommended = entries.find((e) => e.mcVersion === mcVersion);
+    return recommended?.forgeVersion ?? null;
+  } catch {
+    if (!invoke) throw new Error(`Failed to resolve Forge version for ${mcVersion}`);
+    const proxied = (await invoke("resolve_forge_version", { mcVersion })) as string | null;
+    return proxied ?? null;
+  }
 }
 
 /** Fetches NeoForge versions from the Maven versions endpoint. */

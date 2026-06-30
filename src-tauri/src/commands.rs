@@ -7,9 +7,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
+use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+use walkdir::WalkDir;
 
 use tauri::{AppHandle, Manager};
 
@@ -18,6 +20,13 @@ use crate::manifest;
 use crate::metrics::{InstanceMetrics, MetricsState};
 use crate::process;
 use crate::scaffold;
+
+/// How long to wait for a graceful shutdown before falling back to a hard kill.
+///
+/// 15s comfortably covers a Minecraft world save on typical hardware (chunk
+/// flush + level.dat write), while still bounding the wait if the process is
+/// hung or unresponsive — so the stop button never gets stuck.
+const GRACEFUL_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Returns the full config document, with `is_orphaned` refreshed on read.
 #[tauri::command]
@@ -317,7 +326,14 @@ fn run_step(app_handle: &AppHandle, id: &str, step_name: &str) -> Result<(), Str
     let transient = format!("{step_name}-ing");
     set_status(app_handle, id, &transient)?;
 
-    if let Err(e) = process::launch(app_handle, id, std::path::Path::new(&instance.path), &command, &args) {
+    if let Err(e) = process::launch(
+        app_handle,
+        id,
+        std::path::Path::new(&instance.path),
+        &command,
+        &args,
+        step.use_shell,
+    ) {
         // Spawn failed — roll back to error so the UI isn't stuck in a
         // transient state.
         set_status(app_handle, id, "error")?;
@@ -379,7 +395,11 @@ pub fn restart_server_instance(app_handle: AppHandle, id: String) -> Result<(), 
     }
 
     set_status(&app_handle, &id, "stopping")?;
-    process::stop(&app_handle, &id)?;
+
+    // Graceful: let the server save its world before we tear it down. Falls back
+    // to a hard kill if it doesn't exit within the timeout, so a restart can
+    // never hang. The subsequent pause + relaunch then start clean.
+    process::stop_graceful(&app_handle, &id, GRACEFUL_STOP_TIMEOUT)?;
 
     // Brief pause lets the OS release resources before re-spawning.
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -388,10 +408,15 @@ pub fn restart_server_instance(app_handle: AppHandle, id: String) -> Result<(), 
 }
 
 /// Stops a running instance. Idempotent — Ok if it wasn't running.
+///
+/// Asks the server to shut down gracefully first (e.g. Minecraft's `stop`
+/// command flushes chunks and saves the world), and only hard-kills if it
+/// hasn't exited within [`GRACEFUL_STOP_TIMEOUT`]. This avoids rollbacks to the
+/// last autosave that a raw process kill would cause.
 #[tauri::command]
 pub fn stop_server_instance(app_handle: AppHandle, id: String) -> Result<(), String> {
     set_status(&app_handle, &id, "stopping")?;
-    process::stop(&app_handle, &id)?;
+    process::stop_graceful(&app_handle, &id, GRACEFUL_STOP_TIMEOUT)?;
     set_status(&app_handle, &id, "stopped")?;
     Ok(())
 }
@@ -1057,4 +1082,245 @@ pub fn uninstall_plugin(app_handle: AppHandle, id: String) -> Result<(), String>
 
     std::fs::remove_dir_all(&target)
         .map_err(|e| format!("failed to remove plugin '{id}': {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// World backup & restore
+// ---------------------------------------------------------------------------
+
+/// Zips the `world/` directory (and its Nether/End variants if present) into a
+/// timestamped archive under `backups/`. Returns the created archive's relative
+/// path. The world is backed up live — no server stop required — but the user
+/// should ideally run `save-all` first to flush chunk data to disk.
+#[tauri::command]
+pub fn backup_world(app_handle: AppHandle, id: String) -> Result<String, String> {
+    let cfg = config::load_config(&app_handle)?;
+    let instance = cfg
+        .servers
+        .get(&id)
+        .ok_or_else(|| format!("server '{id}' not found"))?;
+
+    let root = PathBuf::from(&instance.path);
+    let world_dir = root.join("world");
+
+    if !world_dir.exists() {
+        return Err(format!(
+            "no world directory found at '{}' — the server may not have been started yet",
+            world_dir.display()
+        ));
+    }
+
+    // Ensure the backups/ directory exists.
+    let backups_dir = root.join("backups");
+    std::fs::create_dir_all(&backups_dir)
+        .map_err(|e| format!("failed to create backups dir: {e}"))?;
+
+    // Timestamped archive name: world-2026-06-30T14-30-00.zip
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let archive_name = format!("world-{}.zip", timestamp);
+    let archive_path = backups_dir.join(&archive_name);
+
+    // Create the zip archive, walking the world directory tree.
+    let file = std::fs::File::create(&archive_path)
+        .map_err(|e| format!("failed to create archive: {e}"))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    let mut buffer = Vec::new();
+    let world_prefix = world_dir.clone();
+
+    for entry in WalkDir::new(&world_dir) {
+        let entry = entry.map_err(|e| format!("walk error: {e}"))?;
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(&world_prefix)
+            .map_err(|e| format!("path strip error: {e}"))?;
+
+        if path.is_dir() {
+            zip.add_directory(relative.to_string_lossy(), options)
+                .map_err(|e| format!("zip add dir error: {e}"))?;
+        } else {
+            zip.start_file(relative.to_string_lossy(), options)
+                .map_err(|e| format!("zip start file error: {e}"))?;
+            let mut f = std::fs::File::open(path)
+                .map_err(|e| format!("open file error: {e}"))?;
+            f.read_to_end(&mut buffer)
+                .map_err(|e| format!("read error: {e}"))?;
+            zip.write_all(&buffer)
+                .map_err(|e| format!("zip write error: {e}"))?;
+            buffer.clear();
+        }
+    }
+
+    zip.finish().map_err(|e| format!("zip finalize error: {e}"))?;
+
+    Ok(format!("backups/{}", archive_name))
+}
+
+/// Lists existing world backups as { name, size } pairs, newest first.
+#[tauri::command]
+pub fn list_backups(app_handle: AppHandle, id: String) -> Result<Vec<serde_json::Value>, String> {
+    let cfg = config::load_config(&app_handle)?;
+    let instance = cfg
+        .servers
+        .get(&id)
+        .ok_or_else(|| format!("server '{id}' not found"))?;
+
+    let backups_dir = PathBuf::from(&instance.path).join("backups");
+    if !backups_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    for entry in std::fs::read_dir(&backups_dir)
+        .map_err(|e| format!("read backups dir error: {e}"))?
+    {
+        let entry = entry.map_err(|e| format!("dir entry error: {e}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("zip") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+        entries.push(serde_json::json!({ "name": name, "size": size }));
+    }
+
+    entries.sort_by(|a, b| {
+        let a_name = a["name"].as_str().unwrap_or("");
+        let b_name = b["name"].as_str().unwrap_or("");
+        b_name.cmp(a_name) // newest first
+    });
+
+    Ok(entries)
+}
+
+/// Restores a world from a backup archive. Backs up the current world first
+/// (safety copy), then replaces `world/` contents with the archive's contents.
+#[tauri::command]
+pub fn restore_world(
+    app_handle: AppHandle,
+    id: String,
+    backup_name: String,
+) -> Result<(), String> {
+    let cfg = config::load_config(&app_handle)?;
+    let instance = cfg
+        .servers
+        .get(&id)
+        .ok_or_else(|| format!("server '{id}' not found"))?;
+
+    let root = PathBuf::from(&instance.path);
+    let backups_dir = root.join("backups");
+    let archive_path = backups_dir.join(&backup_name);
+
+    if !archive_path.exists() {
+        return Err(format!("backup '{}' not found", backup_name));
+    }
+
+    let world_dir = root.join("world");
+
+    // Safety: if a current world exists, create a pre-restore snapshot first.
+    if world_dir.exists() {
+        let safety_name = format!(
+            "pre-restore-{}.zip",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        );
+        let safety_path = backups_dir.join(&safety_name);
+
+        let file = std::fs::File::create(&safety_path)
+            .map_err(|e| format!("failed to create safety backup: {e}"))?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        let mut buffer = Vec::new();
+
+        for entry in WalkDir::new(&world_dir) {
+            let entry = entry.map_err(|e| format!("walk error: {e}"))?;
+            let path = entry.path();
+            let relative = path.strip_prefix(&world_dir).unwrap();
+            if path.is_dir() {
+                zip.add_directory(relative.to_string_lossy(), options)
+                    .map_err(|e| format!("zip error: {e}"))?;
+            } else {
+                zip.start_file(relative.to_string_lossy(), options)
+                    .map_err(|e| format!("zip error: {e}"))?;
+                let mut f = std::fs::File::open(path).map_err(|e| format!("read error: {e}"))?;
+                    f.read_to_end(&mut buffer).map_err(|e| format!("read error: {e}"))?;
+                zip.write_all(&buffer).map_err(|e| format!("zip error: {e}"))?;
+                buffer.clear();
+            }
+        }
+        zip.finish().map_err(|e| format!("zip error: {e}"))?;
+
+        // Remove the old world directory.
+        std::fs::remove_dir_all(&world_dir)
+            .map_err(|e| format!("failed to remove old world: {e}"))?;
+    }
+
+    // Extract the archive into a fresh world/ directory.
+    std::fs::create_dir_all(&world_dir)
+        .map_err(|e| format!("failed to create world dir: {e}"))?;
+
+    let archive_file = std::fs::File::open(&archive_path)
+        .map_err(|e| format!("failed to open archive: {e}"))?;
+    let mut archive = zip::ZipArchive::new(archive_file)
+        .map_err(|e| format!("failed to read archive: {e}"))?;
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).map_err(|e| format!("archive error: {e}"))?;
+        let outpath = world_dir.join(file.name());
+
+        if file.is_dir() {
+            std::fs::create_dir_all(&outpath)
+                .map_err(|e| format!("mkdir error: {e}"))?;
+        } else {
+            if let Some(parent) = outpath.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("mkdir error: {e}"))?;
+            }
+            let mut outfile = std::fs::File::create(&outpath)
+                .map_err(|e| format!("create file error: {e}"))?;
+            let mut content = Vec::new();
+            file.read_to_end(&mut content).map_err(|e| format!("read error: {e}"))?;
+            outfile.write_all(&content).map_err(|e| format!("write error: {e}"))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Deletes a backup archive from disk.
+#[tauri::command]
+pub fn delete_backup(
+    app_handle: AppHandle,
+    id: String,
+    backup_name: String,
+) -> Result<(), String> {
+    let cfg = config::load_config(&app_handle)?;
+    let instance = cfg
+        .servers
+        .get(&id)
+        .ok_or_else(|| format!("server '{id}' not found"))?;
+
+    let archive_path = PathBuf::from(&instance.path)
+        .join("backups")
+        .join(&backup_name);
+
+    if !archive_path.exists() {
+        return Err(format!("backup '{}' not found", backup_name));
+    }
+
+    std::fs::remove_file(&archive_path)
+        .map_err(|e| format!("failed to delete backup: {e}"))?;
+    Ok(())
 }

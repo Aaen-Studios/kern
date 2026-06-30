@@ -11,6 +11,22 @@ export interface DownloadProgress {
   total: number;
 }
 
+/** Mirrors InstanceMetrics (camelCase on the wire) from metrics.rs */
+export interface InstanceMetrics {
+  cpu: number;
+  ram: number;
+  status: string;
+}
+
+/** Status event payload emitted on `status:<id>`. */
+export interface StatusPayload {
+  state: "running" | "exited";
+  code?: number | null;
+}
+
+/** Unsubscribe function returned by hostAPI.listen(). */
+export type UnlistenFn = () => void;
+
 /** The server instance data passed to the plugin mount function. */
 export interface ServerInstance {
   id: string;
@@ -74,4 +90,9 @@ export interface InstallStep {
   label: string;
   status: "pending" | "running" | "done" | "error";
   message?: string;
+  /** Determinate download percentage (0-100) for a running download step.
+   *  Set alongside `message` during the install's `download()` so the progress
+   *  bar reads from the step itself rather than the unrelated Java-download
+   *  gauge. See installer.ts `download()` and renderInstallSection(). */
+  downloadPct?: number;
 }

@@ -111,6 +111,13 @@ pub struct LifecycleStep {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// When true, the command is run through the OS shell (`sh -c` on Unix,
+    /// `cmd.exe /C` on Windows) instead of being spawned directly. Needed for
+    /// runtimes (Forge/NeoForge) whose installer generates `.bat`/`.sh` launch
+    /// scripts that can't be `exec`'d as a plain binary. Off by default so
+    /// existing manifests spawn exactly as before.
+    #[serde(default)]
+    pub use_shell: bool,
 }
 
 /// Map of lifecycle step name → step. Common keys: "install", "start", "stop".
