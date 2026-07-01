@@ -427,7 +427,15 @@ fn run_step(app_handle: &AppHandle, id: &str, step_name: &str) -> Result<(), Str
     // explicit `cargo_bin` override wins; otherwise we resolve one from the
     // instance's Cargo.toml and inject `--bin <name>` so the step always
     // launches. Skipped entirely when the step already passes `--bin`.
-    if command == "cargo" && step_name == "start" && !args.iter().any(|a| a == "--bin" || a.starts_with("--bin=")) {
+    //
+    // Never touches a custom `start_command` — the user opted into full manual
+    // control there, so whatever they typed (e.g. `cargo run --release`) runs
+    // exactly as written, even if it omits `--bin`.
+    if custom.is_none()
+        && command == "cargo"
+        && step_name == "start"
+        && !args.iter().any(|a| a == "--bin" || a.starts_with("--bin="))
+    {
         let bin = overrides
             .get("cargo_bin")
             .cloned()

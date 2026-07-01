@@ -20,6 +20,7 @@
     "core:window:allow-is-maximized",
     "opener:default",
     "dialog:default",
+    "updater:default",
     {
       "identifier": "shell:allow-execute",
       "allow": [

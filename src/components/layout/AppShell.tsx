@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { TitleBar } from "./TitleBar";
 import { Sidebar } from "./Sidebar";
+import UpdateBanner from "../UpdateBanner";
 import type { ServerInstance } from "../../types/server";
 
 interface AppShellProps {
@@ -35,6 +36,7 @@ export function AppShell({
 }: AppShellProps) {
   return (
     <div className="flex flex-col h-screen overflow-hidden bg-bg-core">
+      <UpdateBanner />
       <TitleBar onHome={onHome} />
       <div className="flex flex-1 min-h-0">
         <Sidebar

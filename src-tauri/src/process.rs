@@ -282,6 +282,24 @@ pub fn shell_split(input: &str) -> Vec<String> {
     input.split_whitespace().map(String::from).collect()
 }
 
+/// Joins args back into a single display line, quoting any that contain spaces
+/// or are empty, so the echoed command line reads back faithfully (e.g. a JVM
+/// arg block stays visually grouped). Best-effort display formatting — the
+/// process is *not* re-launched from this string, so it doesn't need to be a
+/// perfectly round-trippable shell command.
+pub fn shell_join(args: &[String]) -> String {
+    args.iter()
+        .map(|a| {
+            if a.is_empty() || a.contains(' ') {
+                format!("\"{a}\"")
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Builds a `Command` that runs `command` (with `args`) through the OS shell.
 ///
 /// Used for lifecycle steps whose `command` names a script (Forge/NeoForge's
@@ -469,17 +487,26 @@ pub fn launch(
         );
     }
 
-    // 4. Notify the UI the process is now running.
+    // 4. Echo the resolved command line into the terminal + latest.log before
+    //    any process output arrives, so the user can see exactly what was run
+    //    (custom start_command, manifest step, auto-injected --bin, etc.). Built
+    //    by re-quoting args with shell rules so flags containing spaces survive.
+    let event_name = format!("log:{instance_id}:stream");
+    let echo = format!("$ {} {}", command, shell_join(args));
+    let stamped = format!("{} {}", timestamp(), echo);
+    append_log(&log_path, stamped.as_bytes());
+    let _ = app_handle.emit(&event_name, stamped.clone());
+
+    // 5. Notify the UI the process is now running.
     let _ = app_handle.emit(
         &format!("status:{instance_id}"),
         StatusPayload::Running,
     );
 
-    // 5. Two blocking reader threads forward stdout + stderr line-by-line. Std
+    // 6. Two blocking reader threads forward stdout + stderr line-by-line. Std
     //    threads (not tokio) because pipe reads block. The stdout thread owns
     //    teardown: on EOF it waits for the exit code and emits the Exited status
     //    + termination marker (gen-guarded, so a superseded task stays silent).
-    let event_name = format!("log:{instance_id}:stream");
     let status_event = format!("status:{instance_id}");
 
     // --- stderr reader: forward lines, then exit on EOF (no teardown). ---

@@ -11,6 +11,17 @@ node_modules
 dist
 dist-ssr
 *.local
+.env
+
+# Updater signing key (private)
+src-tauri/updater.key
+src-tauri/updater.key.old
+src-tauri/updater.key.pub.old
+src-tauri/.env
+
+# Generated release manifest snapshots (produced by deploy.sh)
+update.json
+update.json.prev
 
 # Editor directories and files
 .vscode/*
