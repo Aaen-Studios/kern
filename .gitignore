@@ -33,3 +33,5 @@ update.json.prev
 *.njsproj
 *.sln
 *.sw?
+*.kern
+*.zip
