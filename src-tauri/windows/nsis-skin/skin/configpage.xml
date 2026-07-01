@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Main install page — deliberately simple: logo + title block, then the
+     INSTALL button. No customize panel, no license gate, no feature toggles. -->
+<Windows>
+  <VerticalLayout name="configpage">
+    <!-- Header: logo + title block -->
+    <VerticalLayout height="160" padding="30,40,30,0">
+      <HorizontalLayout height="80">
+        <Control width="80" height="80" bkimage="file='form\logo.png'" />
+        <Control width="15" />
+        <VerticalLayout>
+          <Label text="KERN" font="2" textcolor="#FFC8C8C8" height="36" />
+          <Label name="versionLabel" text="v0.1.0" font="6" textcolor="#FF6A6A6A" height="20" />
+          <Label text="SIGNAL CLEAR SERVER CONTROL" font="3" textcolor="#FFC8C8C8" height="24" />
+        </VerticalLayout>
+      </HorizontalLayout>
+    </VerticalLayout>
+
+    <!-- Flexible spacer pushes the action bar to the bottom -->
+    <Control />
+
+    <!-- Primary INSTALL button -->
+    <Button name="btnInstall" padding="30,5,30,15" width="140" height="40" text="INSTALL" font="1" textcolor="#FFC8C8C8" normalimage="form\btn_primary_normal.png" hotimage="form\btn_primary_hover.png" pushedimage="form\btn_primary_pressed.png" />
+  </VerticalLayout>
+</Windows>

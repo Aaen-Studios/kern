@@ -1,6 +1,50 @@
 # kern
 
-A desktop server manager built with Tauri 2 + React 19 + TypeScript.
+A desktop server manager for Windows, macOS, and Linux. Register any project as a server instance, configure it via plugins, and control its lifecycle from a clean custom UI.
+
+**Manage any server instance — Minecraft, bots, APIs — with a live terminal, plugin extensibility, and graceful lifecycle control.**
+
+## Features
+
+- **Server Registry**: Register, edit, and remove server instances with custom paths and configuration
+- **Lifecycle Controls**: Start / stop / restart / install with graceful shutdown (Minecraft world saves complete)
+- **Live Terminal**: Stream process output with ANSI colors, send stdin commands
+- **Plugin System**: Extend kern with `.kern` packages defining custom launch commands, config forms, and UI panels
+- **File Editor**: Browse and edit files within instance directories (with path traversal protection)
+- **Process Telemetry**: Real-time CPU/RAM monitoring per-instance and host-wide
+- **Auto-Updater**: Signed in-app updates via GitHub Releases
+- **Multi-Runtime Support**: Minecraft servers (Paper, Purpur, Fabric, Forge, NeoForge) and any executable (Node.js, Rust bots, etc.)
+
+## Quick Start
+
+```bash
+# Install dependencies
+bun install
+
+# Run development build
+bun tauri dev
+```
+
+Navigate to the Plugins page to install server type plugins, then register instances pointing to your server directories.
+
+## Plugin System
+
+Plugins extend kern's capabilities through `.kern` zip archives containing:
+
+- **`manifest.json`** — defines lifecycle commands (`install/start/stop`), configuration schema, and scaffold files
+- **`ui.js`** (optional) — custom React component for UI panels, tabs, and toolbar actions
+
+Plugins can be installed via:
+
+- The Plugin Manager UI (drag-and-drop or file picker)
+- Double-clicking `.kern` files in the OS file manager (deep link support)
+
+Plugins live in `<app_data>/plugins/` and may declaratively:
+
+- Generate server forms with dropdowns, text fields, and cascading defaults
+- Provide starter files via the scaffold system
+- Register custom tabs, toolbar actions, and sidebar items
+- Override default lifecycle steps (e.g., custom start commands for Rust bots)
 
 ## Recommended IDE Setup
 
@@ -15,20 +59,17 @@ bun tauri dev
 
 ## Building & Releasing
 
-Releases are built locally and distributed through GitHub Releases; the in-app
-updater polls `releases/latest/download/update.json` for new versions.
+Releases are built locally and distributed through GitHub Releases; the in-app updater polls `releases/latest/download/update.json` for new versions.
 
 ### First-time setup
 
-Generate a signing keypair (the public key is embedded in `tauri.conf.json`,
-the private key is gitignored at `src-tauri/updater.key`):
+Generate a signing keypair (the public key is embedded in `tauri.conf.json`, the private key is gitignored at `src-tauri/updater.key`):
 
 ```bash
 bun x tauri signer generate -w src-tauri/updater.key -p ""
 ```
 
-Copy `src-tauri/.env.example` to `src-tauri/.env` and fill in the key path /
-password if you set one.
+Copy `src-tauri/.env.example` to `src-tauri/.env` and fill in the key path / password if you set one.
 
 ### Cutting a release
 
@@ -37,10 +78,7 @@ password if you set one.
 ./deploy.sh [new_version]      # e.g. ./deploy.sh 0.2.0
 ```
 
-`deploy.sh` handles: version bumping across `package.json`,
-`tauri.conf.json`, and `Cargo.toml` → `bun tauri build` → artifact packaging
-(`.exe.zip` / `.tar.gz` / `.dmg.gz`) → minisign signing → `update.json`
-generation with multi-platform merge support.
+`deploy.sh` handles: version bumping across `package.json`, `tauri.conf.json`, and `Cargo.toml` → `bun tauri build` → artifact packaging (`.exe.zip` / `.tar.gz` / `.dmg.gz`) → minisign signing → `update.json` generation with multi-platform merge support.
 
 After it finishes, create a `v{version}` GitHub release and upload:
 
@@ -50,6 +88,20 @@ After it finishes, create a `v{version}` GitHub release and upload:
 
 ### Multi-platform releases
 
-Run `./deploy.sh <version>` on each platform with the same version argument.
-Each run merges its platform entry into `update.json` (using `update.json.prev`
-as the base), so a single `update.json` ends up covering every platform.
+Run `./deploy.sh <version>` on each platform with the same version argument. Each run merges its platform entry into `update.json` (using `update.json.prev` as the base), so a single `update.json` ends up covering every platform.
+
+### Custom Windows installer skin
+
+The NSIS installer uses a custom frameless skin (the `nsNiuniuSkin` DirectUI engine) styled in the kern palette — near-black with a signal-green accent and the Signal Radar logo. The skin lives under `src-tauri/windows/nsis-skin/`:
+
+- `skin/` — XML page layouts + PNG assets (buttons, checkboxes, caption controls, progress bar, logo, backgrounds). Committed.
+- `skin.zip` — the zipped skin loaded at install time. **Gitignored**; regenerated by `bun run installer:skin`.
+- `installer.nsi` — the Tauri NSIS template (install/uninstall lifecycle, shortcuts, registry, WebView2, updater `/P`/`/R` handling).
+- The four `nsNiuniuSkin*.dll` engine plugins.
+
+The PNGs are generated from inline SVG via `@resvg/resvg-js` (no Python/Pillow needed), sourcing the kern palette from `src/styles/global.css`. `bun tauri build` runs `scripts/prepare-nsis.mjs` automatically (via `beforeBuildCommand`) to stage `skin.zip`; only re-run the asset generator when the palette or logo changes:
+
+```bash
+bun run installer:assets   # regenerate all skin PNGs + skin.zip
+bun run installer:skin     # re-zip skin/ only (after editing XML)
+```
