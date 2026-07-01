@@ -79,6 +79,15 @@ Name "${PRODUCTNAME}"
 BrandingText "${COPYRIGHT}"
 OutFile "${OUTFILE}"
 
+; Embed the app icon into the installer + uninstaller executables. Without
+; these directives NSIS uses its own generic setup icon even when
+; bundle.windows.nsis.installerIcon is set. {{installer_icon}} is resolved by
+; Tauri to the configured installerIcon path at build time.
+!define INSTALLERICON "{{installer_icon}}"
+!if "${INSTALLERICON}" != ""
+  Icon "${INSTALLERICON}"
+!endif
+
 !define PLACEHOLDER_INSTALL_DIR "placeholder\${PRODUCTNAME}"
 InstallDir "${PLACEHOLDER_INSTALL_DIR}"
 

@@ -6,7 +6,7 @@
 import { readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { join, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { deflateSync } from 'node:zlib';
+import { deflateRawSync } from 'node:zlib';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SKIN_DIR = join(__dirname, '..', 'src-tauri', 'windows', 'nsis-skin', 'skin');
@@ -64,7 +64,10 @@ function buildZip() {
   for (const full of files) {
     const arc = relative(SKIN_DIR, full).replace(/\\/g, '/');
     const data = readFileSync(full);
-    const compressed = deflateSync(data);
+    // ZIP method 8 = raw DEFLATE (RFC 1951, no zlib header/trailer). Using
+    // deflateSync (zlib wrapper) here was the bug that made the nsNiuniuSkin
+    // engine reject install.xml at runtime — it's a strict unzip.
+    const compressed = deflateRawSync(data);
     const crc = crc32(data);
     const nameBuf = Buffer.from(arc, 'utf8');
     const useDeflate = compressed.length < data.length;
