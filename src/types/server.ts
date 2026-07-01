@@ -38,12 +38,20 @@ export interface ServerInstance {
   isOrphaned: boolean;
   /** User-selected configuration values surfaced by the plugin's configSchema. */
   userOverrides: Record<string, string>;
+  /** When true, the instance launches automatically as kern starts. */
+  autoStart: boolean;
 }
 
 /** Global application settings. */
 export interface AppSettings {
   /** Default sandbox path used when no custom location is chosen. */
   defaultSandboxPath: string;
+  /** Launch kern automatically when the user signs in to the OS. */
+  launchOnLogin: boolean;
+  /** When true, closing the window hides to tray instead of quitting. */
+  closeToTray: boolean;
+  /** When launched by the OS at login, start hidden in the tray. */
+  startHiddenInTray: boolean;
 }
 
 /** Root config.json document. */

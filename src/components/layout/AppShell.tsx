@@ -14,6 +14,8 @@ interface AppShellProps {
   onRefresh: () => void;
   showPlugins: boolean;
   onNavigatePlugins: () => void;
+  showSettings: boolean;
+  onNavigateSettings: () => void;
   children: ReactNode;
 }
 
@@ -32,6 +34,8 @@ export function AppShell({
   onRefresh,
   showPlugins,
   onNavigatePlugins,
+  showSettings,
+  onNavigateSettings,
   children,
 }: AppShellProps) {
   return (
@@ -48,6 +52,8 @@ export function AppShell({
           onRefresh={onRefresh}
           showPlugins={showPlugins}
           onNavigatePlugins={onNavigatePlugins}
+          showSettings={showSettings}
+          onNavigateSettings={onNavigateSettings}
         />
         <main className="flex-1 min-w-0 overflow-hidden flex flex-col">{children}</main>
       </div>

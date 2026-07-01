@@ -28,6 +28,29 @@ pub struct AppConfig {
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
     pub default_sandbox_path: String,
+    /// Launch kern automatically when the user signs in to the OS.
+    /// Mirrors the OS-level autostart registration (kept in sync by the
+    /// enable/disable commands) so the UI reflects the persisted intent even
+    /// before the OS entry is (de)registered.
+    #[serde(default)]
+    pub launch_on_login: bool,
+    /// When true, the window close button (×) hides the window to the tray
+    /// instead of quitting; real exit happens via the tray menu. Defaults to
+    /// true so the app behaves as a long-running host by default.
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
+    /// When kern is launched by the OS at login, start hidden in the tray
+    /// rather than showing the window. Manual launches always restore the
+    /// last remembered window visibility.
+    #[serde(default)]
+    pub start_hidden_in_tray: bool,
+}
+
+/// Serde default helper — emits `true`. Used for opt-in booleans that should
+/// default on (e.g. `close_to_tray`) so existing config.json documents
+/// without the field pick up the new behavior automatically.
+fn default_true() -> bool {
+    true
 }
 
 /// A tracked server instance.
@@ -44,6 +67,11 @@ pub struct ServerInstance {
     pub status: String,
     pub is_orphaned: bool,
     pub user_overrides: HashMap<String, String>,
+    /// When true, this instance is launched automatically as kern starts —
+    /// either on manual app launch or on OS-login auto-startup. Backed by a
+    /// per-instance toggle in the UI (detail header + create/edit form).
+    #[serde(default)]
+    pub auto_start: bool,
 }
 
 /// Returns the on-disk directory that holds config.json (and later plugins/).
@@ -75,6 +103,9 @@ fn default_config(app_handle: &AppHandle) -> Result<AppConfig, String> {
         version: CONFIG_VERSION.to_string(),
         settings: AppSettings {
             default_sandbox_path: sandbox.to_string_lossy().to_string(),
+            launch_on_login: false,
+            close_to_tray: true,
+            start_hidden_in_tray: false,
         },
         servers: HashMap::new(),
     })

@@ -17,6 +17,7 @@ import { ServerDetailView } from "./components/servers/ServerDetailView";
 import { ConfirmDialog } from "./components/ui/ConfirmDialog";
 import { ErrorBoundary } from "./components/ui/ErrorBoundary";
 import { PluginManager } from "./components/plugins/PluginManager";
+import { SettingsView } from "./components/settings/SettingsView";
 import { useServers } from "./hooks/useServers";
 import { useLiveStatus } from "./hooks/useLiveStatus";
 import { UiStateProvider, useUiState } from "./hooks/useUiState";
@@ -28,7 +29,8 @@ type View =
   | { kind: "detail" }
   | { kind: "create" }
   | { kind: "edit"; server: ServerInstance }
-  | { kind: "plugins" };
+  | { kind: "plugins" }
+  | { kind: "settings" };
 
 /* ─── Instance sorting ─────────────────────────────────────────────────── */
 
@@ -157,6 +159,21 @@ function AppInner() {
     };
   }, []);
 
+  // Tray → frontend: clicking a server in the tray menu shows the window and
+  // asks us to focus that server's detail view. Payload is the server id.
+  useEffect(() => {
+    const unlisten = listen<string>("kern://focus-server", (event) => {
+      const id = event.payload;
+      if (servers.some((s) => s.id === id)) {
+        handleSelect(id);
+      }
+    });
+    return () => {
+      void unlisten.then((f) => f());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [servers]);
+
   // Overlay live process status onto the persisted list. The sidebar + main
   // list read persisted status, which only refreshes on explicit reload() and
   // races the async status:<id> events — so without this overlay they'd sit on
@@ -194,6 +211,8 @@ function AppInner() {
       setViewLocal({ kind: "detail" });
     } else if (savedView === "plugins") {
       setViewLocal({ kind: "plugins" });
+    } else if (savedView === "settings") {
+      setViewLocal({ kind: "settings" });
     } else {
       setViewLocal({ kind: "list" });
     }
@@ -266,6 +285,7 @@ function AppInner() {
       serverType: input.serverType,
       path: input.path,
       userOverrides: input.userOverrides,
+      autoStart: input.autoStart,
     });
     setViewLocal({ kind: "detail" });
     persistView("detail", selected.id);
@@ -332,6 +352,8 @@ function AppInner() {
       onRefresh={refreshOrphaned}
       showPlugins={view.kind === "plugins"}
       onNavigatePlugins={() => navigate("plugins")}
+      showSettings={view.kind === "settings"}
+      onNavigateSettings={() => navigate("settings")}
     >
       <ErrorBoundary>
         {view.kind === "detail" && selected ? (
@@ -391,6 +413,10 @@ function AppInner() {
                 onBack={() => navigate("list")}
                 preselectedKernPath={deepLinkedKernPath}
               />
+            )}
+
+            {view.kind === "settings" && (
+              <SettingsView key="settings" onBack={() => navigate("list")} />
             )}
           </div>
         )}

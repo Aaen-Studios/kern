@@ -161,6 +161,13 @@ export function ServerDetailView({
     onStatusChange();
   }, [server, onStatusChange]);
 
+  /** Toggle the per-instance "auto-start with kern" flag. */
+  const handleToggleAutoStart = useCallback(async (value: boolean) => {
+    const updated: ServerInstance = { ...server, autoStart: value };
+    await invoke<ServerInstance>("update_server", { server: updated });
+    onStatusChange();
+  }, [server, onStatusChange]);
+
   // Submit the current input line. The console is always active — it doubles
   // as a command dispatcher for lifecycle actions (start/stop/restart/install)
   // when the process isn't running, and pipes raw stdin to the process when it
@@ -417,6 +424,7 @@ export function ServerDetailView({
             handleInstalled={handleInstalled}
             launch={launch}
             onSaveStartCommand={handleSaveStartCommand}
+            onToggleAutoStart={handleToggleAutoStart}
           />
           </div>
 
@@ -704,6 +712,8 @@ interface HeaderToolbarProps {
   launch: () => Promise<void>;
   /** Persist a `start_command` override (empty = use the plugin default). */
   onSaveStartCommand: (cmd: string) => Promise<void>;
+  /** Toggle the per-instance auto-start flag. */
+  onToggleAutoStart: (value: boolean) => Promise<void>;
 }
 
 /**
@@ -713,7 +723,7 @@ interface HeaderToolbarProps {
 function HeaderToolbar({
   liveHex, liveStatus, isEffectivelyRunning, transitioning,
   hasInstallStep, installed, busy, launching,
-  server, restart, stop, install, handleInstalled, launch, onSaveStartCommand,
+  server, restart, stop, install, handleInstalled, launch, onSaveStartCommand, onToggleAutoStart,
 }: HeaderToolbarProps) {
   const { actions } = useToolbarActions();
 
@@ -841,6 +851,27 @@ function HeaderToolbar({
           </>
         )}
       </div>
+
+      {/* Per-instance auto-start toggle. Bound to `server.autoStart`; persists
+          immediately so the flag survives restarts even if the user never
+          visits the edit form. */}
+      <button
+        onClick={() => void onToggleAutoStart(!server.autoStart)}
+        disabled={server.isOrphaned}
+        title={
+          server.autoStart
+            ? "auto-start with kern — click to disable"
+            : "auto-start with kern — click to enable"
+        }
+        className={`px-2 py-1.5 text-xs border font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+          server.autoStart
+            ? "text-signal-high border-signal-low"
+            : "text-zinc-400 border-grid-bounds hover:text-zinc-200 hover:border-signal-low"
+        }`}
+        aria-pressed={server.autoStart}
+      >
+        autostart
+      </button>
 
       {/* Plugin toolbar actions */}
       {actions.map((action) => (

@@ -18,6 +18,12 @@ pub struct WindowState {
     pub width: u32,
     pub height: u32,
     pub maximized: bool,
+    /// Whether the window was hidden to the tray when the app last exited.
+    /// Restored on the next manual launch so "persist... if app was opened or
+    /// just in tray" holds. OS-login auto-launches honor
+    /// `AppSettings.start_hidden_in_tray` instead.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 fn state_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
@@ -57,7 +63,10 @@ pub fn save(app_handle: &AppHandle, state: &WindowState) -> Result<(), String> {
 pub fn capture(window: &WebviewWindow) -> Result<WindowState, String> {
     let maximized = window
         .is_maximized()
-        .map_err(|e| format!("is_maximized failed: {e}"))?;
+        .map_err(|e| format!("is_maximize failed: {e}"))?;
+    let visible = window
+        .is_visible()
+        .map_err(|e| format!("is_visible failed: {e}"))?;
     // outer_size/outer_position return physical pixels already.
     let size = window
         .outer_size()
@@ -71,7 +80,18 @@ pub fn capture(window: &WebviewWindow) -> Result<WindowState, String> {
         width: size.width,
         height: size.height,
         maximized,
+        hidden: !visible,
     })
+}
+
+/// Persists just the `hidden` flag, leaving geometry untouched. Used by the
+/// tray show/hide paths so toggling visibility anywhere updates the remembered
+/// state without rewriting position/size.
+pub fn set_hidden(app_handle: &AppHandle, hidden: bool) {
+    if let Ok(Some(mut state)) = load(app_handle) {
+        state.hidden = hidden;
+        let _ = save(app_handle, &state);
+    }
 }
 
 /// Applies persisted state to the window. Called once during app setup.

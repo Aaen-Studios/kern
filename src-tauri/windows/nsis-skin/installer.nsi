@@ -19,6 +19,29 @@ ManifestDPIAwareness PerMonitorV2
 ${StrCase}
 ${StrLoc}
 
+; ─── APP_ASSOCIATE macro for file associations ───────────────────────────────
+; Registers a file extension with the application. Adapted from NSIS documentation.
+!ifndef APP_ASSOCIATE
+!macro APP_ASSOCIATE EXT NAME DESC ICON ACTION COMMAND
+  ; Delete the old association first (clean install / upgrade scenario)
+  DeleteRegKey SHCTX "Software\Classes\.${EXT}"
+  DeleteRegKey SHCTX "Software\Classes\${NAME}"
+  ; Create new association
+  WriteRegStr SHCTX "Software\Classes\.${EXT}" "" "${NAME}"
+  WriteRegStr SHCTX "Software\Classes\${NAME}" "" "${DESC}"
+  WriteRegStr SHCTX "Software\Classes\${NAME}" "DefaultIcon" "${ICON}"
+  WriteRegStr SHCTX "Software\Classes\${NAME}\shell\open\command" "" "${COMMAND}"
+!macroend
+!endif
+
+; ─── APP_UNASSOCIATE macro for removing file associations ───────────────────
+!ifndef APP_UNASSOCIATE
+!macro APP_UNASSOCIATE EXT NAME
+  DeleteRegKey SHCTX "Software\Classes\.${EXT}"
+  DeleteRegKey SHCTX "Software\Classes\${NAME}"
+!macroend
+!endif
+
 !define WEBVIEW2APPGUID "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 
 !define MANUFACTURER "{{manufacturer}}"
@@ -392,6 +415,12 @@ Function CreateShortcuts
   ${If} ${Errors}
     ClearErrors
   ${EndIf}
+  ; Stamp the shortcut with the AppUserModelID (the bundle id, e.g.
+  ; com.ellio.kern). Without this Windows treats the .lnk as a generic file
+  ; rather than a registered app, so it won't surface reliably in Start menu
+  ; search, taskbar pinning, or jump lists. utils.nsh (provided by Tauri's
+  ; bundler) defines the macro.
+  !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\${PRODUCTNAME}\${PRODUCTNAME}.lnk"
 
   ; Desktop shortcut
   ClearErrors
@@ -402,6 +431,7 @@ Function CreateShortcuts
   ${If} ${Errors}
     ClearErrors
   ${EndIf}
+  !insertmacro SetLnkAppUserModelId "$DESKTOP\${PRODUCTNAME}.lnk"
 
   ; Notify Explorer so shortcuts appear immediately
   System::Call 'shell32.dll::SHChangeNotify(i 0x8000000, i 0, p 0, p 0)'

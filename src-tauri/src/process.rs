@@ -103,6 +103,17 @@ impl ProcessRegistry {
         let map = self.processes.lock().ok()?;
         map.get(id).map(|rp| rp.pid)
     }
+
+    /// Returns the ids of every currently-running instance. Used to build the
+    /// tray menu's "active servers" section and to back the
+    /// `list_running_servers` command. Takes the processes lock briefly and
+    /// drops the guard before returning.
+    pub fn running_ids(&self) -> Vec<String> {
+        match self.processes.lock() {
+            Ok(map) => map.keys().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 /// Resolves `{{userOverrides.<key>}}` placeholders in a template string.
@@ -300,6 +311,24 @@ pub fn shell_join(args: &[String]) -> String {
         .join(" ")
 }
 
+/// Suppresses the console window that Windows would otherwise allocate for a
+/// console-subsystem child (`cmd.exe`, `java.exe`, `node.exe`, `cargo.exe`, …)
+/// spawned by this GUI app. No-op on non-Windows.
+///
+/// Piped stdio alone does not prevent the window — Windows only suppresses
+/// child-console allocation when `CREATE_NO_WINDOW` (0x0800_0000) is passed.
+/// This keeps every spawned process windowless so the app's own terminal is the
+/// only place output is ever seen.
+#[cfg(windows)]
+pub(crate) fn suppress_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+pub(crate) fn suppress_window(_cmd: &mut Command) {}
+
 /// Builds a `Command` that runs `command` (with `args`) through the OS shell.
 ///
 /// Used for lifecycle steps whose `command` names a script (Forge/NeoForge's
@@ -412,6 +441,7 @@ pub fn launch(
         c
     };
     cmd.current_dir(working_dir);
+    suppress_window(&mut cmd);
     let env_path = working_dir.join(".env");
     let env_vars = parse_env_file(&env_path);
     // The Setup-selected JDK path is the source of truth (the explicit
@@ -486,6 +516,11 @@ pub fn launch(
             },
         );
     }
+
+    // The running set just grew — notify the tray so its "active servers"
+    // section + tooltip refresh. Best-effort; a failed emit shouldn't abort
+    // an otherwise-successful launch.
+    let _ = app_handle.emit("kern://running-set-changed", ());
 
     // 4. Echo the resolved command line into the terminal + latest.log before
     //    any process output arrives, so the user can see exactly what was run
@@ -575,6 +610,9 @@ pub fn launch(
                 &status_event,
                 StatusPayload::Exited { code: exit_code },
             );
+            // The running set just shrank — notify the tray so its "active
+            // servers" section + tooltip refresh.
+            let _ = stdout_handle.emit("kern://running-set-changed", ());
             let label = match exit_code {
                 Some(c) => format!("exit {c}"),
                 None => "no exit code".to_string(),

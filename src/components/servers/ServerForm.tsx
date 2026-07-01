@@ -35,6 +35,7 @@ export function ServerForm({ initial, onSubmit, onCancel }: ServerFormProps) {
   const [schemaValues, setSchemaValues] = useState<Record<string, string>>(initial?.userOverrides ?? {});
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [autoStart, setAutoStart] = useState(initial?.autoStart ?? false);
 
   // Pre-fill the path with the default sandbox path for new instances. We only
   // set it if the user hasn't typed anything yet, so a manual clear sticks.
@@ -183,7 +184,7 @@ export function ServerForm({ initial, onSubmit, onCancel }: ServerFormProps) {
 
     setSubmitting(true);
     try {
-      await onSubmit({ name: name.trim(), serverType, path: path.trim(), userOverrides });
+      await onSubmit({ name: name.trim(), serverType, path: path.trim(), userOverrides, autoStart });
     } catch (err) {
       setError(String(err));
     } finally {
@@ -262,6 +263,19 @@ export function ServerForm({ initial, onSubmit, onCancel }: ServerFormProps) {
           {!initial && " · pre-filled with the default sandbox"}
         </p>
       </Field>
+
+      <label className="flex items-center gap-2 cursor-pointer select-none">
+        <input
+          type="checkbox"
+          checked={autoStart}
+          onChange={(e) => setAutoStart(e.target.checked)}
+          className="accent-signal-high"
+        />
+        <span className="text-xs text-zinc-300">auto-start with kern</span>
+        <span className="text-[10px] text-zinc-600">
+          launch this instance automatically whenever kern starts
+        </span>
+      </label>
 
       <fieldset>
         <legend className="mb-2 text-[10px] tracking-[0.2em] uppercase text-zinc-500">

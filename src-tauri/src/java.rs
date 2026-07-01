@@ -96,10 +96,10 @@ pub fn check_java_version(path: String) -> Option<JavaInstall> {
 
 /// Inner implementation — runs `<java> -version` and parses the output.
 fn check_java_version_inner(java_path: &std::path::Path) -> Option<JavaInstall> {
-    let output = Command::new(java_path)
-        .arg("-version")
-        .output()
-        .ok()?;
+    let mut cmd = Command::new(java_path);
+    cmd.arg("-version");
+    crate::process::suppress_window(&mut cmd);
+    let output = cmd.output().ok()?;
 
     // `java -version` writes its output to stderr.
     let stderr = String::from_utf8_lossy(&output.stderr);

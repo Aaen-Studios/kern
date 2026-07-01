@@ -28,7 +28,7 @@ import type { SortPref } from "../types/server";
 
 /* ─── Types ────────────────────────────────────────────────────────────── */
 
-export type ViewKind = "list" | "detail" | "create" | "edit" | "plugins";
+export type ViewKind = "list" | "detail" | "create" | "edit" | "plugins" | "settings";
 
 export interface EditorState {
   /** Ordered relative paths of open files. */

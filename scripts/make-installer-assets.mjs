@@ -237,7 +237,7 @@ function main() {
   // Checkboxes.
   makeCheckbox(16);
 
-  // Install-path edit field background (bottom underline only).
+// Install-path edit field background (bottom underline only).
   render(
     `${svgOpen(200, 28)}<rect x="0" y="25" width="200" height="2" fill="${FG_FAINT}"/>${svgClose}`,
     join(EDIT, 'edit0.png')

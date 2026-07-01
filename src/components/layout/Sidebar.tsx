@@ -13,6 +13,10 @@ interface SidebarProps {
   showPlugins: boolean;
   /** Navigate to the plugin management view. */
   onNavigatePlugins: () => void;
+  /** True when the settings view is active. */
+  showSettings: boolean;
+  /** Navigate to the settings view. */
+  onNavigateSettings: () => void;
 }
 
 /**
@@ -29,6 +33,8 @@ export function Sidebar({
   onRefresh,
   showPlugins,
   onNavigatePlugins,
+  showSettings,
+  onNavigateSettings,
 }: SidebarProps) {
   const { items: pluginItems } = useSidebarItems();
 
@@ -139,6 +145,17 @@ export function Sidebar({
           <span className="text-[9px] text-zinc-600 uppercase tracking-wider">
             manage
           </span>
+        </button>
+        <button
+          onClick={onNavigateSettings}
+          className={`flex w-full items-center gap-2 px-3 py-2.5 text-left border-l-2 transition-colors ${
+            showSettings
+              ? "border-signal-high bg-bg-core"
+              : "border-transparent hover:bg-bg-core"
+          }`}
+        >
+          <span className="text-[11px] text-zinc-500">⚙</span>
+          <span className="flex-1 text-xs text-zinc-400">settings</span>
         </button>
       </nav>
     </aside>

@@ -17,7 +17,8 @@
         "height": 740,
         "minWidth": 880,
         "minHeight": 560,
-        "decorations": false
+        "decorations": false,
+        "visible": false
       }
     ],
     "security": {
@@ -37,6 +38,13 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
+    ],
+    "fileAssociations": [
+      {
+        "ext": ["kern"],
+        "name": "kern Plugin Package",
+        "description": "kern plugin package file"
+      }
     ],
     "windows": {
       "nsis": {

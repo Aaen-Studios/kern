@@ -14,8 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use tauri::{AppHandle, Manager};
+use tauri_plugin_autostart::ManagerExt;
 
-use crate::config::{self, AppConfig, ServerInstance};
+use crate::config::{self, AppConfig, AppSettings, ServerInstance};
 use crate::manifest;
 use crate::metrics::{InstanceMetrics, MetricsState};
 use crate::process;
@@ -51,6 +52,8 @@ pub struct NewServerInput {
     pub path: String,
     #[serde(default)]
     pub user_overrides: HashMap<String, String>,
+    #[serde(default)]
+    pub auto_start: bool,
 }
 
 /// Creates a new server instance and returns the persisted record (with its
@@ -74,6 +77,7 @@ pub fn create_server(
         status: "stopped".to_string(),
         is_orphaned: false,
         user_overrides: input.user_overrides.clone(),
+        auto_start: input.auto_start,
     };
 
     cfg.servers.insert(instance.id.clone(), instance.clone());
@@ -131,6 +135,7 @@ pub fn update_server(
         entry.status = server.status;
         entry.user_overrides = server.user_overrides;
         entry.is_orphaned = server.is_orphaned;
+        entry.auto_start = server.auto_start;
         entry.clone()
     };
 
@@ -205,6 +210,84 @@ pub fn update_server_status(app_handle: AppHandle, id: String, status: String) -
         config::save_config(&app_handle, &cfg)?;
     }
     Ok(())
+}
+
+/// Replaces the persisted global app settings (launch-on-login, close-to-tray,
+/// start-hidden-in-tray). The frontend `useSettings` hook is the only caller.
+#[tauri::command]
+pub fn update_app_settings(
+    app_handle: AppHandle,
+    settings: AppSettings,
+) -> Result<(), String> {
+    let mut cfg = config::load_config(&app_handle)?;
+    cfg.settings = settings;
+    config::save_config(&app_handle, &cfg)
+}
+
+/// Registers kern as an OS-login launch item (Windows Run key / Linux
+/// autostart / macOS Login Item via LaunchAgent). The persisted
+/// `launch_on_login` flag is kept in sync so the UI reflects the intent.
+#[tauri::command]
+pub fn enable_autostart(app_handle: AppHandle) -> Result<(), String> {
+    app_handle
+        .autolaunch()
+        .enable()
+        .map_err(|e| format!("failed to enable autostart: {e}"))?;
+    let mut cfg = config::load_config(&app_handle)?;
+    cfg.settings.launch_on_login = true;
+    config::save_config(&app_handle, &cfg)
+}
+
+/// Removes the OS-login launch item. The persisted flag is cleared even if the
+/// OS entry was already gone, so the UI never shows a stale "enabled" state.
+#[tauri::command]
+pub fn disable_autostart(app_handle: AppHandle) -> Result<(), String> {
+    let _ = app_handle.autolaunch().disable();
+    let mut cfg = config::load_config(&app_handle)?;
+    cfg.settings.launch_on_login = false;
+    config::save_config(&app_handle, &cfg)
+}
+
+/// Reports whether the OS-login launch item is currently registered. Reads the
+/// autostart manager directly (not just the persisted flag) so external changes
+/// (e.g. the user disabling it via Task Manager) are reflected.
+#[tauri::command]
+pub fn is_autostart_enabled(app_handle: AppHandle) -> bool {
+    app_handle.autolaunch().is_enabled().unwrap_or(false)
+}
+
+/// One entry in the list of currently-running instances. Joins the live
+/// process table (id + pid) with the registry (name) for display in the tray
+/// menu and elsewhere.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunningServerInfo {
+    pub id: String,
+    pub name: String,
+    pub pid: u32,
+}
+
+/// Lists every currently-running instance (id, name, pid). Names are resolved
+/// from the persisted registry; an id with no matching registry entry (e.g.
+/// deleted while running) falls back to the id.
+#[tauri::command]
+pub fn list_running_servers(app_handle: AppHandle) -> Result<Vec<RunningServerInfo>, String> {
+    let registry: tauri::State<'_, process::ProcessRegistry> = app_handle.state();
+    let ids = registry.running_ids();
+    let cfg = config::load_config(&app_handle)?;
+    let infos = ids
+        .into_iter()
+        .map(|id| {
+            let name = cfg
+                .servers
+                .get(&id)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| id.clone());
+            let pid = registry.pid_for(&id).unwrap_or(0);
+            RunningServerInfo { id, name, pid }
+        })
+        .collect();
+    Ok(infos)
 }
 
 /// Returns live CPU/RAM telemetry for a running instance, driven by the
@@ -658,6 +741,13 @@ pub fn launch_server_instance(app_handle: AppHandle, id: String) -> Result<(), S
     run_step(&app_handle, &id, "start")
 }
 
+/// Public entry point for launching an instance's "start" step from outside the
+/// command surface (used by the auto-start-on-launch path in `lib::setup`).
+/// Thin wrapper around the shared `run_step` helper.
+pub fn launch_instance(app_handle: &AppHandle, id: &str) -> Result<(), String> {
+    run_step(app_handle, id, "start")
+}
+
 /// Runs an arbitrary lifecycle step (install, build, test, etc.) from the
 /// instance's plugin manifest. The step name is resolved with runtime
 /// qualification (e.g. `install.rust` when the instance has `runtime=rust`).
@@ -770,6 +860,7 @@ pub fn run_instance_command(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    process::suppress_window(&mut cmd);
 
     // 3. Set transient status.
     set_status(&app_handle, &id, "setup")?;
