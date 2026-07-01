@@ -151,6 +151,16 @@ export function ServerDetailView({
     } catch { /* non-fatal */ }
   }, [server.id]);
 
+  /** Persist a per-instance custom start command via the `start_command` override. */
+  const handleSaveStartCommand = useCallback(async (cmd: string) => {
+    const updated: ServerInstance = {
+      ...server,
+      userOverrides: { ...server.userOverrides, start_command: cmd },
+    };
+    await invoke<ServerInstance>("update_server", { server: updated });
+    onStatusChange();
+  }, [server, onStatusChange]);
+
   // Submit the current input line. The console is always active — it doubles
   // as a command dispatcher for lifecycle actions (start/stop/restart/install)
   // when the process isn't running, and pipes raw stdin to the process when it
@@ -406,6 +416,7 @@ export function ServerDetailView({
             install={install}
             handleInstalled={handleInstalled}
             launch={launch}
+            onSaveStartCommand={handleSaveStartCommand}
           />
           </div>
 
@@ -691,6 +702,8 @@ interface HeaderToolbarProps {
   install: () => Promise<void>;
   handleInstalled: () => Promise<void>;
   launch: () => Promise<void>;
+  /** Persist a `start_command` override (empty = use the plugin default). */
+  onSaveStartCommand: (cmd: string) => Promise<void>;
 }
 
 /**
@@ -700,12 +713,27 @@ interface HeaderToolbarProps {
 function HeaderToolbar({
   liveHex, liveStatus, isEffectivelyRunning, transitioning,
   hasInstallStep, installed, busy, launching,
-  server, restart, stop, install, handleInstalled, launch,
+  server, restart, stop, install, handleInstalled, launch, onSaveStartCommand,
 }: HeaderToolbarProps) {
   const { actions } = useToolbarActions();
 
+  // Inline editor for the per-instance custom start command. Stored as the
+  // `start_command` override; when set, the host runs it verbatim instead of
+  // the plugin's declared start step. Empty/whitespace clears it and falls
+  // back to the plugin default.
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const saved = (server.userOverrides.start_command ?? "").trim();
+  useEffect(() => { setEditing(false); }, [server.id]); // reset on instance switch
+  useEffect(() => { if (!editing) setDraft(saved); }, [editing, saved]);
+
+  async function commit() {
+    await onSaveStartCommand(draft.trim());
+    setEditing(false);
+  }
+
   return (
-    <div className="flex items-center gap-2 shrink-0">
+    <div className="flex items-center gap-2 shrink-0 relative">
       <span
         className="text-[11px] font-mono px-3 py-1.5 border"
         style={{ color: liveHex, borderColor: `${liveHex}55` }}
@@ -753,6 +781,66 @@ function HeaderToolbar({
           </button>
         </>
       )}
+
+      {/* Per-instance start command override (⚙). */}
+      <div className="relative">
+        <button
+          onClick={() => setEditing((v) => !v)}
+          disabled={server.isOrphaned}
+          title={saved ? `custom start: ${saved}` : "customize start command"}
+          className={`px-2 py-1.5 text-xs border font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+            saved
+              ? "text-signal-high border-signal-low"
+              : "text-zinc-400 border-grid-bounds hover:text-zinc-200 hover:border-signal-low"
+          }`}
+          aria-label="customize start command"
+        >
+          {/* gear icon — inline so no asset dependency */}
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <circle cx="8" cy="8" r="2.4" />
+            <path d="M8 1.5v1.8M8 12.7v1.8M14.5 8h-1.8M3.3 8H1.5M12.6 3.4l-1.3 1.3M4.7 11.3l-1.3 1.3M12.6 12.6l-1.3-1.3M4.7 4.7L3.4 3.4" />
+          </svg>
+        </button>
+        {editing && (
+          <>
+            {/* click-away catcher */}
+            <div className="fixed inset-0 z-40" onClick={() => setEditing(false)} />
+            <div className="absolute right-0 top-full mt-1 z-50 w-80 bg-bg-core border border-grid-bounds shadow-lg p-3">
+              <p className="text-[10px] tracking-[0.2em] uppercase text-zinc-500 mb-2">
+                custom start command
+              </p>
+              <input
+                autoFocus
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") { e.preventDefault(); void commit(); }
+                  if (e.key === "Escape") { setDraft(saved); setEditing(false); }
+                }}
+                placeholder={saved || "e.g. cargo run --bin widgets-bot"}
+                className="w-full bg-black/40 border border-grid-bounds focus:border-signal-low outline-none px-2 py-1.5 text-[11px] font-mono text-zinc-200"
+              />
+              <p className="mt-1.5 text-[10px] text-zinc-600 leading-snug">
+                overrides the plugin's start step for this project only. blank = use plugin default.
+              </p>
+              <div className="flex justify-end gap-1.5 mt-2">
+                <button
+                  onClick={() => { setDraft(""); }}
+                  className="px-2 py-1 text-[10px] text-zinc-400 hover:text-zinc-200 border border-grid-bounds"
+                >
+                  clear
+                </button>
+                <button
+                  onClick={() => void commit()}
+                  className="px-2 py-1 text-[10px] text-bg-core bg-signal-high font-semibold"
+                >
+                  save
+                </button>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
 
       {/* Plugin toolbar actions */}
       {actions.map((action) => (

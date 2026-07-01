@@ -381,15 +381,67 @@ fn run_step(app_handle: &AppHandle, id: &str, step_name: &str) -> Result<(), Str
         }
     }
 
-    let command = process::resolve_variables(&step.command, &overrides);
-    // Each manifest arg entry is templated, then shell-split so that a single
-    // entry like "{{userOverrides.jvm_args}}" (which expands to many -XX flags)
-    // becomes individual process arguments instead of one giant quoted string.
-    let args: Vec<String> = step
-        .args
-        .iter()
-        .flat_map(|a| process::shell_split(&process::resolve_variables(a, &overrides)))
-        .collect();
+    // ── Per-instance custom start command ───────────────────────────────
+    // A user can override the plugin's start step entirely by filling in the
+    // `start_command` override (set via the ⚙ button next to Start). When
+    // present and non-empty, we parse it as a shell-style command line and use
+    // it verbatim, ignoring the manifest's `start` step. Lets each project run
+    // whatever it actually needs (e.g. `bun run dev`, a specific binary, an
+    // env-injected invocation) without editing the plugin manifest.
+    let custom = overrides
+        .get("start_command")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let (command, mut args): (String, Vec<String>) = if step_name == "start" {
+        if let Some(line) = custom {
+            // Shell-split: first token is the program, the rest are args.
+            let mut parts = process::shell_split(&process::resolve_variables(line, &overrides));
+            if parts.is_empty() {
+                return Err("custom start_command is empty".to_string());
+            }
+            let prog = parts.remove(0);
+            (prog, parts)
+        } else {
+            let c = process::resolve_variables(&step.command, &overrides);
+            let a: Vec<String> = step
+                .args
+                .iter()
+                .flat_map(|x| process::shell_split(&process::resolve_variables(x, &overrides)))
+                .collect();
+            (c, a)
+        }
+    } else {
+        let c = process::resolve_variables(&step.command, &overrides);
+        let a: Vec<String> = step
+            .args
+            .iter()
+            .flat_map(|x| process::shell_split(&process::resolve_variables(x, &overrides)))
+            .collect();
+        (c, a)
+    };
+
+    // ── Cargo multi-binary auto-resolve ─────────────────────────────────
+    // `cargo run` / `cargo build` with no `--bin` errors out on workspaces
+    // that define several binaries and no `default-run` ("could not determine
+    // which binary to run"). If the plugin lets the host pick the target, an
+    // explicit `cargo_bin` override wins; otherwise we resolve one from the
+    // instance's Cargo.toml and inject `--bin <name>` so the step always
+    // launches. Skipped entirely when the step already passes `--bin`.
+    if command == "cargo" && step_name == "start" && !args.iter().any(|a| a == "--bin" || a.starts_with("--bin=")) {
+        let bin = overrides
+            .get("cargo_bin")
+            .cloned()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| resolve_cargo_bin(std::path::Path::new(&instance.path)));
+        if let Some(name) = bin {
+            // cargo expects `run --bin <name> [args…]` — splice `--bin <name>`
+            // right after the leading subcommand (`run` / `build`).
+            if let Some(idx) = args.iter().position(|a| a == "run" || a == "build") {
+                args.insert(idx + 1, "--bin".to_string());
+                args.insert(idx + 2, name);
+            }
+        }
+    }
 
     // Set a transient status like "starting", "installing", etc.
     let transient = format!("{step_name}-ing");
@@ -423,6 +475,70 @@ fn run_step(app_handle: &AppHandle, id: &str, step_name: &str) -> Result<(), Str
         set_status(app_handle, id, "running")?;
     }
     Ok(())
+}
+
+/// Resolves a `--bin <name>` for a `cargo run` / `cargo build` step when the
+/// workspace defines more than one binary target and declares no `default-run`.
+/// Without this, Cargo errors out with "could not determine which binary to run"
+/// and the start step never spawns.
+///
+/// Resolution order:
+///   1. An explicit `cargo_bin` override (user can pin a target).
+///   2. The package name from `[package] name = "…"` (Cargo's implicit default
+///      when a `src/main.rs` exists with no explicit `[[bin]]`).
+///   3. The single `[[bin]] name = "…"` if exactly one is declared.
+///   4. The first `[[bin]]` when several exist (deterministic — sorted), so
+///      multi-binary workspaces always launch instead of erroring.
+///
+/// Returns None when no Cargo.toml is present (then `cargo run` runs as-is and
+/// is expected to succeed for a normal single-binary project).
+fn resolve_cargo_bin(root: &std::path::Path) -> Option<String> {
+    let toml = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+
+    // Walk the manifest tracking the current section header so we only treat a
+    // `name = "…"` as a binary target when it lives under `[[bin]]`.
+    let mut section = String::new();
+    let mut pkg_name: Option<String> = None;
+    let mut bins: Vec<String> = Vec::new();
+    for line in toml.lines() {
+        let t = line.trim();
+        if t.starts_with('[') && t.ends_with(']') {
+            // Strip every layer of brackets so both `[package]` and `[[bin]]`
+            // reduce to a bare section key ("package", "bin").
+            section = t.trim_matches(|c| c == '[' || c == ']').trim().to_string();
+            continue;
+        }
+        let Some((k, v)) = t.split_once('=') else { continue };
+        let key = k.trim();
+        let val = v.trim().trim_end_matches(',').trim();
+        let quoted = val
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .map(str::to_string);
+        if section == "package" && key == "name" {
+            pkg_name = quoted.clone();
+        }
+        if section == "bin" && key == "name" {
+            if let Some(q) = quoted {
+                bins.push(q);
+            }
+        }
+    }
+
+    // Explicit [[bin]] tables win over the implicit main.rs default.
+    if !bins.is_empty() {
+        if bins.len() == 1 {
+            return Some(bins[0].clone());
+        }
+        // Several [[bin]] targets: pick one deterministically (sorted) so the
+        // start step always launches instead of erroring.
+        bins.sort();
+        return Some(bins[0].clone());
+    }
+
+    // No explicit [[bin]] — fall back to the package name, which Cargo treats
+    // as the implicit target when src/main.rs exists.
+    pkg_name
 }
 
 /// Strips the extension from a script filename so `build_shell_command` can
