@@ -50,6 +50,8 @@ export interface FileEditorActions {
   listDirectory: (relPath: string) => Promise<FileEntry[]>;
   /** Delete a file or empty directory. */
   deletePath: (relPath: string) => Promise<void>;
+  /** Create a new empty file (writes empty content). */
+  createFile: (relPath: string) => Promise<void>;
   /** Create a directory (and parents). */
   createDirectory: (relPath: string) => Promise<void>;
   /** Rename or move a file/directory. */
@@ -266,7 +268,7 @@ export function useFileEditor(serverId: string): FileEditorState & FileEditorAct
   const deletePath = useCallback(
     async (relPath: string) => {
       await safeCall(async () => {
-        await invoke("delete_server_path", { id: serverId, relPath });
+        await invoke("delete_server_path_recursive", { id: serverId, relPath });
         // Remove from open files if open.
         setOpenFiles((prev) => {
           if (!prev.has(relPath)) return prev;
@@ -281,6 +283,15 @@ export function useFileEditor(serverId: string): FileEditorState & FileEditorAct
           }
           return prev;
         });
+      });
+    },
+    [serverId, safeCall],
+  );
+
+  const createFile = useCallback(
+    async (relPath: string) => {
+      await safeCall(async () => {
+        await invoke("write_server_file", { id: serverId, relPath, content: "" });
       });
     },
     [serverId, safeCall],
@@ -356,6 +367,7 @@ export function useFileEditor(serverId: string): FileEditorState & FileEditorAct
     isDirty,
     listDirectory,
     deletePath,
+    createFile,
     createDirectory,
     renamePath,
     clearError,

@@ -13,11 +13,14 @@
  */
 
 import { useState, useCallback, useEffect, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { FileTree } from "./FileTree";
 import { EditorTabBar } from "./EditorTabBar";
 import { CodeEditor, configureMonaco } from "./CodeEditor";
 import { useFileEditor } from "../../hooks/useFileEditor";
 import { useUiState } from "../../hooks/useUiState";
+import { ConfirmDialog } from "../ui/ConfirmDialog";
 
 interface FileEditorPanelProps {
   /** Server instance id — scopes all file operations. */
@@ -46,6 +49,10 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
     setFileContent,
     clearError,
     listDirectory,
+    deletePath,
+    createFile,
+    createDirectory,
+    renamePath,
   } = useFileEditor(serverId);
 
   const { uiState, updateServer } = useUiState();
@@ -67,8 +74,69 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
   const [cursorLine, setCursorLine] = useState(editorUi.cursorLine);
   const [cursorCol, setCursorCol] = useState(editorUi.cursorCol);
 
+  // Delete confirmation dialog state.
+  const [deleteConfirm, setDeleteConfirm] = useState<{
+    relPath: string;
+    name: string;
+    isDir: boolean;
+  } | null>(null);
+
   // Track whether we've already restored the open-file session for this server.
   const restoredRef = useRef(false);
+
+  // ── Drag-drop shared state ───────────────────────────────────────────────
+  // Ref holds the latest hovered directory path (updated by FileTree on
+  // dragover/dragleave). State is for React re-renders (visual feedback).
+  const dragOverRelPathRef = useRef<string | null>(null);
+  const [dragOverRelPath, setDragOverRelPath] = useState<string | null>(null);
+
+  const handleDragOverChange = useCallback((path: string | null) => {
+    dragOverRelPathRef.current = path;
+    setDragOverRelPath(path);
+  }, []);
+
+  // Set up Tauri's native drag-drop listener for OS file drops.
+  // HTML5 DnD doesn't expose file data in Tauri's webview — we need the
+  // onDragDropEvent API which provides absolute file paths.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        unlisten = await getCurrentWebview().onDragDropEvent((event) => {
+          if (cancelled) return;
+
+          if (event.payload.type === "drop") {
+            // Read the target directory from the shared ref (last dragover).
+            const targetDir = dragOverRelPathRef.current ?? "";
+            // Copy each dropped file into the server directory.
+            invoke("copy_files_to_server", {
+              id: serverId,
+              sourcePaths: event.payload.paths,
+              targetRelPath: targetDir,
+            }).then(() => {
+              if (!cancelled) setRefreshTree((k) => k + 1);
+            }).catch((e) => {
+              console.error("Drop copy failed:", e);
+            });
+            // Clear highlight.
+            handleDragOverChange(null);
+          } else if (event.payload.type === "leave") {
+            handleDragOverChange(null);
+          }
+          // 'enter' and 'over' types: visual feedback handled by HTML5 dragover.
+        });
+      } catch (e) {
+        console.warn("Failed to register Tauri drag-drop listener:", e);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [serverId, handleDragOverChange]);
 
   // Restore open files on mount: reload each persisted path from disk.
   useEffect(() => {
@@ -105,10 +173,10 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
   }, []);
 
   // Wrapped actions
+
   const handleSetActiveFile = useCallback(
     (relPath: string | null) => {
       setActiveFile(relPath);
-      // Persist the active-file change.
       updateServer(serverId, {
         editor: {
           ...editorUi,
@@ -126,7 +194,6 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
   const handleOpenFile = useCallback(
     async (relPath: string) => {
       await openFile(relPath);
-      // Persist the new open-file set + active file.
       const newOpenFiles = Array.from(openFiles.keys());
       if (!openFiles.has(relPath)) {
         newOpenFiles.push(relPath);
@@ -149,12 +216,10 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
     (relPath: string) => {
       const file = openFiles.get(relPath);
       if (file?.isDirty) {
-        // Auto-save on close when dirty (TODO: add confirmation dialog).
         saveFile(relPath).then(() => closeFile(relPath));
         return;
       }
       closeFile(relPath);
-      // Persist the updated open-file set.
       const newOpenFiles = Array.from(openFiles.keys()).filter((p) => p !== relPath);
       const newActive = activeFile === relPath ? (newOpenFiles[newOpenFiles.length - 1] ?? null) : activeFile;
       updateServer(serverId, {
@@ -188,8 +253,6 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
     (line: number, column: number) => {
       setCursorLine(line);
       setCursorCol(column);
-      // Persist cursor position (lightweight — fires on every move, but
-      // the debounced save in useUiState coalesces the writes).
       updateServer(serverId, {
         editor: {
           ...editorUi,
@@ -213,7 +276,6 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
         } else {
           next.add(relPath);
         }
-        // Persist the updated expansion state.
         updateServer(serverId, {
           editor: {
             ...editorUi,
@@ -230,6 +292,96 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
     [serverId, updateServer, editorUi, openFiles, activeFile, cursorLine, cursorCol],
   );
 
+  // ── New file / folder ────────────────────────────────────────────────────
+
+  const handleCreateFile = useCallback(
+    async (parentRelPath: string, name: string) => {
+      const fullPath = parentRelPath ? `${parentRelPath}/${name}` : name;
+      await createFile(fullPath);
+      setRefreshTree((k) => k + 1);
+      // Open the newly created file in the editor.
+      await handleOpenFile(fullPath);
+    },
+    [createFile, handleOpenFile],
+  );
+
+  const handleCreateFolder = useCallback(
+    async (parentRelPath: string, name: string) => {
+      const fullPath = parentRelPath ? `${parentRelPath}/${name}` : name;
+      await createDirectory(fullPath);
+      setRefreshTree((k) => k + 1);
+    },
+    [createDirectory],
+  );
+
+  // ── Rename ───────────────────────────────────────────────────────────────
+
+  const handleRename = useCallback(
+    async (oldRelPath: string, newRelPath: string) => {
+      await renamePath(oldRelPath, newRelPath);
+      setRefreshTree((k) => k + 1);
+    },
+    [renamePath],
+  );
+
+  // ── Delete ───────────────────────────────────────────────────────────────
+
+  const handleDeleteRequest = useCallback(
+    (relPath: string, isDir: boolean) => {
+      const name = relPath.split("/").pop() ?? relPath;
+      setDeleteConfirm({ relPath, name, isDir });
+    },
+    [],
+  );
+
+  const handleConfirmDelete = useCallback(async () => {
+    if (!deleteConfirm) return;
+    await deletePath(deleteConfirm.relPath);
+    setDeleteConfirm(null);
+    setRefreshTree((k) => k + 1);
+  }, [deleteConfirm, deletePath]);
+
+  const handleCancelDelete = useCallback(() => {
+    setDeleteConfirm(null);
+  }, []);
+
+  // ── Reveal in explorer / copy path ───────────────────────────────────────
+
+  const handleRevealInExplorer = useCallback(
+    async (relPath: string) => {
+      try {
+        await invoke("open_server_path", { id: serverId, relPath });
+      } catch (e) {
+        console.error("Reveal in explorer failed:", e);
+      }
+    },
+    [serverId],
+  );
+
+  const handleCopyPath = useCallback(
+    async (relPath: string) => {
+      try {
+        await navigator.clipboard.writeText(relPath);
+      } catch (e) {
+        console.error("Copy path failed:", e);
+      }
+    },
+    [],
+  );
+
+  // ── Drag-and-drop: move within tree ──────────────────────────────────────
+
+  const handleMoveFile = useCallback(
+    async (sourceRelPath: string, targetDirRelPath: string) => {
+      const name = sourceRelPath.split("/").pop() ?? sourceRelPath;
+      const newRelPath = targetDirRelPath ? `${targetDirRelPath}/${name}` : name;
+      if (newRelPath === sourceRelPath) return;
+      await renamePath(sourceRelPath, newRelPath);
+      setRefreshTree((k) => k + 1);
+    },
+    [renamePath],
+  );
+
   // Trigger a tree refresh when openFiles size changes (file was created/deleted).
   useEffect(() => {
     setRefreshTree((t) => t + 1);
@@ -242,13 +394,45 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
     <div className="flex flex-1 min-h-0">
       {/* File tree sidebar */}
       <div className="w-[220px] shrink-0 flex flex-col border-r border-grid-bounds matrix-border">
+        {/* Explorer header */}
         <div className="flex items-center justify-between px-3 py-1.5 border-b border-grid-bounds">
           <span className="text-[10px] tracking-[0.2em] uppercase text-zinc-500">
             explorer
           </span>
-          <span className="text-[10px] text-zinc-600 tabular-nums">
-            {tabs.length}
-          </span>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => {
+                // Trigger a new-file creation at root via the tree key.
+                // We signal this via a key-change trick: the tree re-renders and
+                // picks up the create state. Simpler: direct call to handleCreateFile
+                // with an empty inline prompt would be better. For now, we use
+                // a prompt-based approach.
+                const name = prompt("Enter file name:");
+                if (name && name.trim()) {
+                  handleCreateFile("", name.trim());
+                }
+              }}
+              className="text-[10px] text-zinc-500 hover:text-zinc-200 transition-colors px-1"
+              title="New File…"
+            >
+              + file
+            </button>
+            <button
+              onClick={() => {
+                const name = prompt("Enter folder name:");
+                if (name && name.trim()) {
+                  handleCreateFolder("", name.trim());
+                }
+              }}
+              className="text-[10px] text-zinc-500 hover:text-zinc-200 transition-colors px-1"
+              title="New Folder…"
+            >
+              + folder
+            </button>
+            <span className="text-[10px] text-zinc-600 tabular-nums ml-1">
+              {tabs.length}
+            </span>
+          </div>
         </div>
         <FileTree
           serverId={serverId}
@@ -258,6 +442,20 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
           expandedPaths={expandedPaths}
           onToggleExpand={handleToggleExpand}
           refreshKey={refreshTree}
+          // New file/folder
+          onCreateFile={handleCreateFile}
+          onCreateFolder={handleCreateFolder}
+          // Rename/move
+          onRename={handleRename}
+          onMoveFile={handleMoveFile}
+          // Delete
+          onDelete={handleDeleteRequest}
+          // Context actions
+          onRevealInExplorer={handleRevealInExplorer}
+          onCopyPath={handleCopyPath}
+          // Drag-drop shared state (visual feedback from Tauri + HTML5)
+          dragOverRelPath={dragOverRelPath}
+          onDragOverChange={handleDragOverChange}
         />
       </div>
 
@@ -354,6 +552,24 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
           </div>
         )}
       </div>
+
+      {/* Delete confirmation dialog */}
+      <ConfirmDialog
+        open={deleteConfirm !== null}
+        title="Delete"
+        message={
+          deleteConfirm
+            ? deleteConfirm.isDir
+              ? `This will permanently delete "${deleteConfirm.name}" and ALL its contents.`
+              : `Permanently delete "${deleteConfirm.name}"?`
+            : ""
+        }
+        confirmLabel="delete"
+        cancelLabel="cancel"
+        variant="danger"
+        onConfirm={handleConfirmDelete}
+        onCancel={handleCancelDelete}
+      />
     </div>
   );
 }

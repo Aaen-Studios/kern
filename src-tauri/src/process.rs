@@ -359,6 +359,14 @@ fn build_shell_command(command: &str, args: &[String]) -> Command {
 /// which `Command::new` can't do directly. The `command` string is passed to
 /// the shell as-is; `args` are appended after it (shell-quoted on Unix so a
 /// flag with spaces survives).
+///
+/// `java_path` is the JDK selected on the instance's Setup page (the live
+/// `user_overrides["java_path"]`), passed in explicitly so it can't drift from
+/// the `.env` file (which is only written at creation and may be stale after
+/// the user changes Java). When present it drives the `JAVA_HOME` / `PATH`
+/// derivation that lets shell-based steps (Forge/NeoForge run scripts, which
+/// invoke `java` from PATH rather than our `command`) resolve the same JDK the
+/// user picked.
 pub fn launch(
     app_handle: &AppHandle,
     instance_id: &str,
@@ -366,6 +374,7 @@ pub fn launch(
     command: &str,
     args: &[String],
     use_shell: bool,
+    java_path: Option<&str>,
 ) -> Result<(), String> {
     // 0. Start fresh: truncate latest.log so the seeded tail reflects only this
     //    run, not the previous run's `[process terminated …]` marker.
@@ -386,8 +395,33 @@ pub fn launch(
     };
     cmd.current_dir(working_dir);
     let env_path = working_dir.join(".env");
-    for (k, v) in parse_env_file(&env_path) {
+    let env_vars = parse_env_file(&env_path);
+    // The Setup-selected JDK path is the source of truth (the explicit
+    // `java_path` arg); `.env` may be stale since it's only written at server
+    // creation. From it derive JAVA_HOME and prepend the JDK's bin/ to PATH so
+    // shell-based steps (Forge/NeoForge run scripts, which call `java` from
+    // PATH rather than our `command`) resolve the same JDK the user picked.
+    let java_bin_dir = java_path
+        .filter(|p| !p.is_empty())
+        .and_then(|p| std::path::Path::new(p).parent().map(|p| p.to_path_buf()));
+    let java_home_derived = java_bin_dir.as_ref().and_then(|bin| bin.parent()).map(|p| p.to_path_buf());
+    for (k, v) in &env_vars {
         cmd.env(k, v);
+    }
+    if let Some(jh) = &java_home_derived {
+        let jh_str = jh.to_string_lossy().to_string();
+        if !env_vars.iter().any(|(k, _)| k == "JAVA_HOME") {
+            cmd.env("JAVA_HOME", &jh_str);
+        }
+    }
+    // Prepend JDK bin/ to PATH so the correct `java` binary is found first.
+    // Use the OS-native separator (`;` on Windows, `:` on Unix) so this works
+    // cross-platform.
+    if let Some(bin) = &java_bin_dir {
+        let bin_str = bin.to_string_lossy().to_string();
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        cmd.env("PATH", format!("{bin_str}{sep}{current_path}"));
     }
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());

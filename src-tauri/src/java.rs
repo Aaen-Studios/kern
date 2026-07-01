@@ -29,10 +29,11 @@ pub struct JavaInstall {
 
 /// Detects all Java installations on the system.
 ///
-/// Checks `JAVA_HOME`, PATH lookup for `java`/`javaw`, and scans well-known
-/// install directories per platform.
+/// Checks `JAVA_HOME`, PATH lookup for `java`/`javaw`, scans well-known
+/// install directories per platform, and optionally scans `<server_path>/jdk/`
+/// for plugin-downloaded JDKs.
 #[tauri::command]
-pub fn detect_java() -> Vec<JavaInstall> {
+pub fn detect_java(server_path: Option<String>) -> Vec<JavaInstall> {
     let mut found: Vec<JavaInstall> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -48,6 +49,32 @@ pub fn detect_java() -> Vec<JavaInstall> {
 
         if let Some(info) = check_java_version_inner(&candidate) {
             found.push(info);
+        }
+    }
+
+    // Also scan the server's jdk/ directory for plugin-downloaded JDKs.
+    if let Some(sp) = &server_path {
+        let jdk_dir = std::path::Path::new(sp).join("jdk");
+        if jdk_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&jdk_dir) {
+                for entry in entries.flatten() {
+                    let java_bin = if cfg!(target_os = "windows") {
+                        entry.path().join("bin").join("java.exe")
+                    } else {
+                        entry.path().join("bin").join("java")
+                    };
+                    let path = java_bin.to_string_lossy().to_string();
+                    if seen.contains(&path) {
+                        continue;
+                    }
+                    if java_bin.is_file() {
+                        seen.insert(path);
+                        if let Some(info) = check_java_version_inner(&java_bin) {
+                            found.push(info);
+                        }
+                    }
+                }
+            }
         }
     }
 

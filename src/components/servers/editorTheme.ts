@@ -235,6 +235,27 @@ export const KERN_THEME: editor.IStandaloneThemeData = {
     { token: "log-number", foreground: "ce9178" },
     { token: "log-string", foreground: "4cf5a0" },
     { token: "log-stacktrace", foreground: "4c525e" },
+
+    // ── Custom Monarch: Nix ─────────────────────────────────────────────────
+    { token: "nix-comment", foreground: "4c525e", fontStyle: "italic" },
+    { token: "nix-keyword", foreground: "f5a04c" },
+    { token: "nix-constant", foreground: "569cd6" },
+    { token: "nix-string", foreground: "4cf5a0" },
+    { token: "nix-string-multiline", foreground: "4cf5a0" },
+    { token: "nix-interpolation", foreground: "dcdcaa" },
+    { token: "nix-attribute", foreground: "9cdcfe" },
+    { token: "nix-path", foreground: "4fc1ff" },
+    { token: "nix-number", foreground: "ce9178" },
+
+    // ── Custom Monarch: Diff / Patch ────────────────────────────────────────
+    { token: "diff-command", foreground: "4c525e", fontStyle: "italic" },
+    { token: "diff-file-header", foreground: "569cd6" },
+    { token: "diff-hunk-header", foreground: "569cd6" },
+    { token: "diff-inserted", foreground: "4cf5a0" },
+    { token: "diff-deleted", foreground: "f54c4c" },
+    { token: "diff-context", foreground: "d4d4d4" },
+    { token: "diff-meta", foreground: "4c525e" },
+    { token: "diff-binary", foreground: "f54c4c" },
   ],
   colors: {
     "editor.background": "#050506",

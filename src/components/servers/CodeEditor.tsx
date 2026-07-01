@@ -25,6 +25,83 @@ loader.config({ monaco: monacoEditor });
 function initializeMonaco() {
   monacoEditor.editor.defineTheme("kern-dark", KERN_THEME);
   registerCustomLanguages(monacoEditor);
+
+  // ── Register simple formatters for config file languages ──────────────
+  // These sort keys alphabetically and normalize spacing.
+
+  /** Creates a formatter that sorts key=value lines within a document. */
+  function createConfigFormatter() {
+    return {
+      provideDocumentFormattingEdits: (
+        model: monacoEditor.editor.ITextModel,
+      ) => {
+        const fullRange = model.getFullModelRange();
+        const lines = model.getValue().split("\n");
+        const result: string[] = [];
+        let sectionBuffer: { key: string; line: string }[] = [];
+
+        function flushBuffer() {
+          if (sectionBuffer.length === 0) return;
+          sectionBuffer.sort((a, b) => a.key.localeCompare(b.key));
+          for (const item of sectionBuffer) {
+            result.push(item.line);
+          }
+          sectionBuffer = [];
+        }
+
+        for (const raw of lines) {
+          const trimmed = raw.trim();
+
+          // Preserve blank lines and comments (with their original indentation).
+          if (trimmed === "" || trimmed.startsWith("#") || trimmed.startsWith(";") || trimmed.startsWith("!")) {
+            flushBuffer();
+            result.push(raw);
+            continue;
+          }
+
+          // Section headers in ini: [section]
+          if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+            flushBuffer();
+            result.push(raw);
+            continue;
+          }
+
+          // Key=value line — buffer and sort later.
+          const eqIdx = trimmed.indexOf("=");
+          const colonIdx = trimmed.indexOf(":");
+          const sepIdx = eqIdx > 0 ? eqIdx : colonIdx > 0 ? colonIdx : -1;
+          if (sepIdx > 0) {
+            const key = trimmed.slice(0, sepIdx).trim();
+            const value = trimmed.slice(sepIdx + 1).trim();
+            const sep = eqIdx > 0 ? " = " : ": ";
+            // Preserve leading whitespace for indentation context.
+            const indent = raw.match(/^\s*/)?.[0] ?? "";
+            sectionBuffer.push({ key, line: `${indent}${key}${sep}${value}` });
+          } else {
+            flushBuffer();
+            result.push(raw);
+          }
+        }
+        flushBuffer();
+
+        const newText = result.join("\n");
+        if (newText === model.getValue()) return [];
+        return [{ range: fullRange, text: newText }];
+      },
+    };
+  }
+
+  const configLanguages = ["env", "properties", "ini"];
+  for (const langId of configLanguages) {
+    try {
+      monacoEditor.languages.registerDocumentFormattingEditProvider(
+        langId,
+        createConfigFormatter(),
+      );
+    } catch {
+      // Language might not be registered yet — skip gracefully.
+    }
+  }
 }
 initializeMonaco();
 
@@ -72,10 +149,19 @@ export function CodeEditor({
       // Store model ref for proper disposal on unmount.
       modelRef.current = ed.getModel() ?? null;
 
-      // Register Ctrl/Cmd+S save action.
-      ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-        onSave();
-      });
+	      // Register Ctrl/Cmd+S save action — format then save.
+	      ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, async () => {
+	        await ed.getAction("editor.action.formatDocument")?.run();
+	        onSave();
+	      });
+
+	      // Register Alt+Shift+F as "Format Document".
+	      ed.addCommand(
+	        monaco.KeyMod.Alt | monaco.KeyMod.Shift | monaco.KeyCode.KeyF,
+	        () => {
+	          ed.getAction("editor.action.formatDocument")?.run();
+	        },
+	      );
 
       // Report cursor position changes to the parent.
       if (onCursorPosition) {

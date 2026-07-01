@@ -13,7 +13,7 @@
  * Each tab renders a full tab-page layout matching the kern design system.
  */
 
-import type { ServerInstance, HostAPI, JavaInstall, InstallStep, UnlistenFn, StatusPayload, InstanceMetrics } from "./types";
+import type { ServerInstance, HostAPI, JavaInstall, InstallStep, UnlistenFn, StatusPayload, InstanceMetrics, JarDetectionResult } from "./types";
 import type { VersionInfo } from "./versionFetcher";
 import { fetchVersionsForRuntime } from "./versionFetcher";
 import { detectJava, mcVersionToJavaVersion, filterJavaForMc } from "./javaSelector";
@@ -65,6 +65,14 @@ interface WizardState {
    *  in renderBackupSection doesn't re-fire forever when the list is empty. */
   backupsLoaded: boolean;
   backupRunning: boolean;
+  // JAR detection state
+  jarDetection: {
+    detected: string | null;
+    exists: boolean;
+    candidates: string[];
+    message: string;
+  } | null;
+  jarChecking: boolean;
 }
 
 let state: WizardState | null = null;
@@ -167,12 +175,20 @@ export async function mount(
   const runtime = overrides.runtime || "paper";
 
   let javaInstalls: JavaInstall[] = [];
-  try { javaInstalls = await detectJava(hostAPI.invoke); } catch { /* non-fatal */ }
+  try { javaInstalls = await detectJava(hostAPI.invoke, hostAPI.serverPath); } catch { /* non-fatal */ }
 
   let autoJava = overrides.java_path || "java";
   if (autoJava === "java" && javaInstalls.length > 0) {
     const filtered = filterJavaForMc(javaInstalls, mcVersion || "1.21");
     autoJava = filtered.length > 0 ? filtered[0].path : javaInstalls[0].path;
+    // Persist the auto-selected JDK so the value shown in Setup is the one
+    // actually used at launch. Without this, java_path stays "java" in config
+    // and run_step launches with `java` from PATH instead of the detected JDK.
+    // One-shot: only fires when we upgraded the "java" default to a real path.
+    if (autoJava !== "java") {
+      serverData.userOverrides = { ...overrides, java_path: autoJava };
+      persistOverride(hostAPI, serverData, "java_path", autoJava);
+    }
   }
 
   const javaMajor = mcVersionToJavaVersion(mcVersion || "1.21");
@@ -194,12 +210,14 @@ export async function mount(
     bans: [], ops: [],
     manageTab: "properties",
     backups: [], backupLoading: false, backupsLoaded: false, backupRunning: false,
+    jarDetection: null, jarChecking: false,
   };
 
   render();
   await fetchAndSetVersions(runtime, false);
   subscribeToServer();
   void checkRunning();
+  void checkServerJar();
 
   // ── Register "Setup" tab ────────────────────────────────────
   hostAPI.registerTab({
@@ -295,6 +313,29 @@ async function checkRunning(): Promise<void> {
     state.running = isRunning;
     render();
   } catch { /* non-fatal */ }
+}
+
+async function checkServerJar(): Promise<void> {
+  if (!state) return;
+  state.jarChecking = true;
+  render();
+  try {
+    const result = await state.hostAPI.invoke("detect_server_jar", {
+      id: state.serverData.id,
+    }) as JarDetectionResult;
+    if (!state) return;
+    state.jarDetection = {
+      detected: result.detectedJar,
+      exists: result.exists,
+      candidates: result.candidates,
+      message: result.message,
+    };
+  } catch (err) {
+    if (!state) return;
+    state.jarDetection = { detected: null, exists: false, candidates: [], message: String(err) };
+  }
+  state.jarChecking = false;
+  render();
 }
 
 function subscribeToServer(): void {
@@ -546,6 +587,15 @@ function renderSetupTab(): HTMLElement {
         ]),
         $("div", { class: "mc-section-body" }, [
           renderJavaSection(),
+        ]),
+      ]),
+      // Server JAR section
+      $("div", { class: "mc-section" }, [
+        $("div", { class: "mc-section-header" }, [
+          $("span", { class: "mc-section-title" }, ["Server JAR"]),
+        ]),
+        $("div", { class: "mc-section-body" }, [
+          renderJarSection(),
         ]),
       ]),
       // Install
@@ -1694,7 +1744,7 @@ function renderJavaSection(): HTMLElement {
         const fresh: JavaInstall = installed
           ? { path: installed.path, version: installed.version, majorVersion: installed.majorVersion }
           : { path: `${destDir}/bin/java`, version: `${state.javaMajor}.0.0`, majorVersion: state.javaMajor };
-        detectJava(state.hostAPI.invoke)
+        detectJava(state.hostAPI.invoke, state.hostAPI.serverPath)
           .then((detected) => {
             if (!state) return;
             const merged = [fresh];
@@ -1725,7 +1775,7 @@ function renderJavaSection(): HTMLElement {
     $("button", { class: "mc-btn mc-btn-sm", type: "button" }, ["[ref]"]).tap((btn) => {
       btn.addEventListener("click", async () => {
         try {
-          const installs = await detectJava(state!.hostAPI.invoke);
+          const installs = await detectJava(state!.hostAPI.invoke, state!.hostAPI.serverPath);
           if (!state) return;
           state.javaInstalls = installs;
           state.javaMissing = !installs.some((j) => j.majorVersion >= state!.javaMajor);
@@ -1783,6 +1833,66 @@ function javaInstallsSummary(installs: JavaInstall[], mcVersion: string): HTMLEl
   ]);
 }
 
+function renderJarSection(): HTMLElement {
+  const s = state!;
+  const overrides = s.serverData.userOverrides ?? {};
+  const customJar = overrides.server_jar || "";
+  const detection = s.jarDetection;
+
+  // Row: text input + detect button
+  const input = $<HTMLInputElement>("input", {
+    class: "mc-java-path-input", type: "text",
+    placeholder: "Auto-detect (leave empty)", value: customJar,
+  });
+  input.addEventListener("input", () => { if (state) state.serverData = {
+    ...state.serverData,
+    userOverrides: { ...(state.serverData.userOverrides ?? {}), server_jar: input.value },
+  }; });
+  input.addEventListener("change", () => {
+    if (!state) return;
+    persistOverride(state.hostAPI, state.serverData, "server_jar", input.value);
+    void checkServerJar();
+  });
+
+  const detectBtn = $<HTMLButtonElement>("button", {
+    class: cls("mc-btn", "mc-btn-sm", s.jarChecking ? "mc-btn-disabled" : ""),
+    type: "button",
+  }, [s.jarChecking ? "checking…" : "[ref]"]);
+  if (s.jarChecking) detectBtn.setAttribute("disabled", "true");
+  detectBtn.addEventListener("click", () => { if (state && !state.jarChecking) void checkServerJar(); });
+
+  const inputRow = $("div", { class: "mc-java-row" }, [input, detectBtn]);
+
+  // Status feedback
+  let statusEl: HTMLElement;
+  if (detection) {
+    if (detection.exists && detection.detected) {
+      statusEl = $("p", { class: "mc-java-info" }, [detection.message]);
+    } else if (customJar && !detection.exists) {
+      statusEl = $("p", { class: "mc-java-warn" }, [`(!) ${detection.message}`]);
+    } else {
+      statusEl = $("p", { class: "mc-java-warn" }, [`(!) ${detection.message}`]);
+    }
+  } else if (s.jarChecking) {
+    statusEl = $("p", { class: "mc-java-info" }, ["Detecting server JAR…"]);
+  } else {
+    statusEl = $("p", { class: "mc-java-info" }, [""]);
+  }
+
+  // Hint: show candidates if detection found nothing
+  const hintEl = detection && !detection.exists && detection.candidates.length > 0
+    ? $("p", { class: "mc-java-info", style: "opacity:0.6;font-size:11px" }, [
+        `Checked: ${detection.candidates.join(", ")}`,
+      ])
+    : null;
+
+  return $("div", {}, [
+    inputRow,
+    statusEl,
+    hintEl ?? $("span", { style: "display:none" }),
+  ]);
+}
+
 function renderInstallSection(): HTMLElement {
   const s = state!;
   const overrides = s.serverData.userOverrides ?? {};
@@ -1803,7 +1913,7 @@ function renderInstallSection(): HTMLElement {
     state.installing = true; state.installSteps = []; state.installLog = []; state.installError = false;
     render();
     const acceptEula = (overrides.accept_eula === "true");
-    runInstall(state.serverData.id, runtime, state.mcVersion, state.selectedJava, acceptEula, overrides.jvm_args, state.hostAPI, {
+    runInstall(state.serverData.id, runtime, state.mcVersion, state.selectedJava, acceptEula, overrides.jvm_args, overrides.server_jar || undefined, state.hostAPI, {
       onStepUpdate(steps) { if (!state) return; state.installSteps = steps; render(); },
       onLog(line) {
         if (!state) return;
@@ -1815,6 +1925,8 @@ function renderInstallSection(): HTMLElement {
         if (!state) return;
         state.installing = false; state.installError = !success;
         state.installLog.push(success ? `[ok]  ${message}` : `[err]  ${message}`);
+        // Re-detect jar after install so the status section updates.
+        if (success) void checkServerJar();
         render();
       },
     }).catch((err: unknown) => {

@@ -28,6 +28,10 @@ export async function runInstall(
   /** The user's jvm_args override, used to seed user_jvm_args.txt for
    *  Forge/NeoForge (whose generated run scripts read it via @user_jvm_args.txt). */
   jvmArgsOverride: string | undefined,
+  /** Optional custom jar filename. When set, the downloaded jar is saved with
+   *  this name instead of the default. Forge/NeoForge are unaffected (they
+   *  don't download a jar directly). */
+  serverJarOverride: string | undefined,
   hostAPI: HostAPI,
   cb: InstallCallbacks,
 ): Promise<void> {
@@ -105,16 +109,6 @@ export async function runInstall(
     });
   }
 
-  /** Returns true when running on Windows. The host runs the lifecycle step
-   *  through the OS shell (sh on Unix, cmd.exe on Windows — see process.rs
-   *  build_shell_command), so the launcher script we write must match the
-   *  platform the server actually runs on. */
-  function isWindows(): boolean {
-    return typeof navigator !== "undefined"
-      ? /Win/i.test(navigator.platform || navigator.userAgent)
-      : false;
-  }
-
   /** Writes user_jvm_args.txt with the user's heap/GC flags derived from the
    *  jvm_args override. Forge/NeoForge's generated run scripts read this via
    *  `@user_jvm_args.txt`, so without it the server launches with default
@@ -122,21 +116,6 @@ export async function runInstall(
   async function writeUserJvmArgs(jvmArgs?: string): Promise<void> {
     const args = (jvmArgs ?? "-Xms2G -Xmx2G").trim();
     await writeFile("user_jvm_args.txt", args + "\n");
-  }
-
-  /** Writes a cross-platform launcher script that runs the OS-appropriate
-   *  `run.sh` / `run.bat` the Forge/NeoForge installer generated. The manifest
-   *  invokes this script with useShell=true; build_shell_command (host-side)
-   *  picks the matching shell, and this script picks the matching run script,
-   *  so the same manifest step works on both platforms. */
-  async function writeModloaderLauncher(): Promise<void> {
-    if (isWindows()) {
-      // cmd.exe: call the generated run.bat, passing through any args (nogui).
-      await writeFile("kern_start.bat", "@echo off\r\ncall run.bat %*\r\n");
-    } else {
-      // sh: exec the generated run.sh, passing through args.
-      await writeFile("kern_start.sh", "#!/usr/bin/env sh\nexec sh run.sh \"$@\"\n");
-    }
   }
 
   // -----------------------------------------------------------------------
@@ -164,7 +143,8 @@ export async function runInstall(
     return;
   }
 
-  const jarPath = `${serverPath}/server.jar`;
+  const jarName = (serverJarOverride?.trim()) || "server.jar";
+  const jarPath = `${serverPath}/${jarName}`;
 
   try {
     switch (runtime) {
@@ -258,7 +238,6 @@ export async function runInstall(
         const cfgArgsStep = addStep("Write launch config");
         setStep(cfgArgsStep, "running");
         await writeUserJvmArgs(jvmArgsOverride);
-        await writeModloaderLauncher();
         setStep(cfgArgsStep, "done");
         break;
       }
@@ -287,7 +266,6 @@ export async function runInstall(
         const cfgArgsStep = addStep("Write launch config");
         setStep(cfgArgsStep, "running");
         await writeUserJvmArgs(jvmArgsOverride);
-        await writeModloaderLauncher();
         setStep(cfgArgsStep, "done");
         break;
       }

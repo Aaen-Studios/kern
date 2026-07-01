@@ -96,3 +96,11 @@ export interface InstallStep {
    *  gauge. See installer.ts `download()` and renderInstallSection(). */
   downloadPct?: number;
 }
+
+/** Result of server JAR auto-detection from detect_server_jar. */
+export interface JarDetectionResult {
+  detectedJar: string | null;
+  exists: boolean;
+  candidates: string[];
+  message: string;
+}

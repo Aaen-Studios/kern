@@ -309,6 +309,168 @@ const logLanguage: languages.IMonarchLanguage = {
 };
 
 /**
+ * Monarch definition for Nix expression language (.nix files).
+ *
+ * Tokenizes:
+ *   - `# comment` / `/* block comment *&#47;`   → nix-comment
+ *   - `import`, `with`, `let`, `in`, `if`, `then`, `else`, `assert`,
+ *     `rec`, `inherit`, `or`                      → nix-keyword
+ *   - `true`, `false`, `null`                    → nix-constant
+ *   - `"string"` + interpolation `${}`          → nix-string, nix-interpolation
+ *   - `'' multi-line string ''`                  → nix-string-multiline
+ *   - `attr.ibute.path` or `rec { set }`        → nix-attribute
+ *   - `/path/to/file`, `<nixpkgs>`               → nix-path
+ *   - `123`, `0x1A`                               → nix-number
+ */
+const nixLanguage: languages.IMonarchLanguage = {
+  ignoreCase: false,
+  brackets: [
+    { open: "{", close: "}", token: "delimiter.curly" },
+    { open: "[", close: "]", token: "delimiter.square" },
+    { open: "(", close: ")", token: "delimiter.parenthesis" },
+  ],
+  tokenizer: {
+    root: [
+      // Block comments
+      [/\/\*.*?\*\//, "nix-comment"],
+      [/\/\*/, "nix-comment", "@blockComment"],
+
+      // Line comments
+      [/#.*$/, "nix-comment"],
+
+      // Paths: angle-bracket paths <nixpkgs>
+      [/<[^>\s]+>/, "nix-path"],
+
+      // Paths: /absolute or ./relative
+      [/(?:\/|~\/|\.\/|\.\.\/)[^\s{}[\];,:=()"]*/, "nix-path"],
+
+      // Numbers
+      [/\b\d+(\.\d+)?([eE][+-]?\d+)?\b/, "nix-number"],
+      [/\b0[xX][0-9a-fA-F]+\b/, "nix-number"],
+
+      // Keywords
+      [/\b(import|with|let|in|if|then|else|assert|rec|inherit|or|lib)\b/, "nix-keyword"],
+
+      // Constants
+      [/\b(true|false|null)\b/, "nix-constant"],
+
+      // Multi-line strings ('' ... '')
+      [/'(\\.|[^'\\])*'/, "nix-string-multiline", "@multiLineString"],
+
+      // Double-quoted strings with interpolation
+      [/"/, "nix-string", "@doubleQuotedString"],
+
+      // URIs
+      [/\b(https?|ftp|file):\/\/[^\s{}[\];,:=()"]+/, "nix-path"],
+
+      // Attribute access: a.b.c
+      [/[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)+/, "nix-attribute"],
+
+      // Identifiers
+      [/[a-zA-Z_][a-zA-Z0-9_]*/, "identifier"],
+
+      // Operators / delimiters
+      [/[{}()[\]]/, "@brackets"],
+      [/[;:,]/, "delimiter"],
+      [/[=]/, "operator"],
+    ],
+
+    blockComment: [
+      [/[^/*]+/, "nix-comment"],
+      [/\*\//, "nix-comment", "@pop"],
+      [/[/*]/, "nix-comment"],
+    ],
+
+    doubleQuotedString: [
+      [/[^\\"$]+/, "nix-string"],
+      [/\\./, "nix-string"],
+      [/\$\{/, "nix-interpolation", "@interpolation"],
+      [/"/, "nix-string", "@pop"],
+    ],
+
+    multiLineString: [
+      [/'$/, "nix-string-multiline", "@pop"],
+      [/[^']*'/, "nix-string-multiline"],
+    ],
+
+    interpolation: [
+      [/[^}]+/, "nix-keyword"],
+      [/\}/, "nix-interpolation", "@pop"],
+    ],
+  },
+};
+
+/**
+ * Monarch definition for unified diff / patch files (.patch, .diff).
+ *
+ * Tokenizes:
+ *   - `---` / `+++` file headers             → diff-file-header
+ *   - `@@ -l,c +l,c @@` hunk headers         → diff-hunk-header
+ *   - Lines starting with `+`                → diff-inserted
+ *   - Lines starting with `-`                → diff-deleted
+ *   - Lines starting with a space            → diff-context
+ *   - `diff --git a/ b/` headers             → diff-command
+ *   - `index`, `new file`, `deleted file`    → diff-meta
+ *   - `Binary files ... differ`              → diff-binary
+ */
+const diffLanguage: languages.IMonarchLanguage = {
+  ignoreCase: false,
+  tokenizer: {
+    root: [
+      // diff --git a/ b/ header
+      [/^diff\s+/, "diff-command", "@diffCommand"],
+
+      // --- a/file  / +++ b/file
+      [/^---\s+/, "diff-file-header", "@oldFile"],
+      [/^\+\+\+\s+/, "diff-file-header", "@newFile"],
+
+      // @@ -l,c +l,c @@ hunk header
+      [/^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@/, "diff-hunk-header"],
+
+      // Index line: index abc123..def456 100644
+      [/^index\s+[0-9a-f]+\.\.[0-9a-f]+/, "diff-meta"],
+
+      // new file mode / deleted file mode
+      [/^(new|deleted)\s+file\s+(mode\s+\d+)?/, "diff-meta"],
+
+      // Binary files differ
+      [/^Binary\s+files\s+.*differ$/, "diff-binary"],
+
+      // Added lines
+      [/^\+.*$/, "diff-inserted"],
+
+      // Removed lines
+      [/^\-.*$/, "diff-deleted"],
+
+      // Context lines (starting with space)
+      [/^ .*$/, "diff-context"],
+
+      // Empty lines
+      [/^$/, ""],
+
+      // Fallback
+      [/.*$/, ""],
+    ],
+
+    diffCommand: [
+      [/\s+/, ""],
+      [/--git/, "diff-command"],
+      [/a\/\S+/, "diff-file-header"],
+      [/b\/\S+/, "diff-file-header"],
+      [/.*$/, "", "@pop"],
+    ],
+
+    oldFile: [
+      [/.*$/, "diff-file-header", "@pop"],
+    ],
+
+    newFile: [
+      [/.*$/, "diff-file-header", "@pop"],
+    ],
+  },
+};
+
+/**
  * Registers all custom Monarch languages with Monaco.
  * Safe to call multiple times — Monaco ignores duplicate registrations.
  *
@@ -321,6 +483,8 @@ export function registerCustomLanguages(monaco: typeof import("monaco-editor")) 
   monaco.languages.register({ id: "ignore" });
   monaco.languages.register({ id: "ini" });
   monaco.languages.register({ id: "log" });
+  monaco.languages.register({ id: "nix" });
+  monaco.languages.register({ id: "diff" });
 
   // Set Monarch tokenizers
   monaco.languages.setMonarchTokensProvider("env", envLanguage);
@@ -328,6 +492,8 @@ export function registerCustomLanguages(monaco: typeof import("monaco-editor")) 
   monaco.languages.setMonarchTokensProvider("ignore", ignoreLanguage);
   monaco.languages.setMonarchTokensProvider("ini", iniLanguage);
   monaco.languages.setMonarchTokensProvider("log", logLanguage);
+  monaco.languages.setMonarchTokensProvider("nix", nixLanguage);
+  monaco.languages.setMonarchTokensProvider("diff", diffLanguage);
 
   // Note: registerExtensions is not available in Monaco 0.52. The extension
   // → language mapping is handled by the EXTENSION_LANGUAGE_MAP in

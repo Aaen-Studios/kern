@@ -81,6 +81,12 @@ const EXTENSION_LANGUAGE_MAP: Record<string, string> = {
   scss: "scss",
   sass: "scss",
   less: "less",
+  styl: "stylus",
+
+  // ── Web: Frameworks / Components ────────────────────────────────────────
+  svelte: "html",
+  vue: "html",
+  astro: "html",
 
   // ── Web: Templates / Frameworks ─────────────────────────────────────────
   pug: "pug",
@@ -114,7 +120,11 @@ const EXTENSION_LANGUAGE_MAP: Record<string, string> = {
   conf: "ini",
   properties: "properties", // custom Monarch
   env: "env",               // custom Monarch
-  reg: " plaintext",
+  reg: "plaintext",
+  hcl: "hcl",
+  tf: "hcl",
+  tfvars: "hcl",
+  nix: "nix",               // custom Monarch
 
   // ── Protocols / Schemas ─────────────────────────────────────────────────
   proto: "proto",
@@ -140,7 +150,7 @@ const EXTENSION_LANGUAGE_MAP: Record<string, string> = {
   nim: "plaintext",
   nims: "plaintext",
 
-  // ── Systems: Swift / Kotlin / Scala / Dart ──────────────────────────────
+  // ── Swift / Kotlin / Scala / Dart / Objective-C ─────────────────────────
   swift: "swift",
   kt: "kotlin",
   ktm: "kotlin",
@@ -148,6 +158,8 @@ const EXTENSION_LANGUAGE_MAP: Record<string, string> = {
   scala: "scala",
   sc: "scala",
   dart: "dart",
+  m: "objective-c",
+  mm: "objective-c",
 
   // ── Systems: Haskell / OCaml / F# / Erlang / Elixir ─────────────────────
   hs: "haskell",
@@ -189,6 +201,7 @@ const EXTENSION_LANGUAGE_MAP: Record<string, string> = {
   // ── JVM: Java / Groovy / Clojure ───────────────────────────────────────
   java: "java",
   groovy: "groovy",
+  gradle: "groovy",
   clj: "clojure",
   cljs: "clojure",
   cljc: "clojure",
@@ -208,7 +221,7 @@ const EXTENSION_LANGUAGE_MAP: Record<string, string> = {
   // ── R / Julia / Mathematica ─────────────────────────────────────────────
   r: "r",
   R: "r",
-  jl: "plaintext",
+  jl: "julia",
   wl: "plaintext",
   wls: "plaintext",
 
@@ -224,6 +237,18 @@ const EXTENSION_LANGUAGE_MAP: Record<string, string> = {
   tcl: "plaintext",
   pde: "c",               // processing
   ino: "c",               // arduino
+
+  // ── Diff / Patch ─────────────────────────────────────────────────────────
+  patch: "diff",           // custom Monarch
+  diff: "diff",            // custom Monarch
+
+  // ── COBOL ────────────────────────────────────────────────────────────────
+  cbl: "cobol",            // custom Monarch
+  cob: "cobol",            // custom Monarch
+
+  // ── Notebooks / Diagrams ─────────────────────────────────────────────────
+  ipynb: "json",           // Jupyter notebooks are JSON
+  drawio: "xml",           // Draw.io diagrams are SVG/XML
 };
 
 /**
@@ -238,7 +263,7 @@ const FILENAME_LANGUAGE_MAP: Record<string, string> = {
   "docker-compose.yaml": "yaml",
   "docker-compose.override.yml": "yaml",
   "docker-compose.override.yaml": "yaml",
-  ".dockerignore": "plaintext",
+  ".dockerignore": "ignore",
 
   // ── Build systems ──────────────────────────────────────────────────────────
   "cmakelists.txt": "plaintext",
@@ -296,8 +321,8 @@ const FILENAME_LANGUAGE_MAP: Record<string, string> = {
   "mix.lock": "plaintext",
 
   // ── Git ────────────────────────────────────────────────────────────────────
-  ".gitignore": "plaintext",
-  ".gitattributes": "plaintext",
+  ".gitignore": "ignore",
+  ".gitattributes": "ignore",
   ".gitmodules": "plaintext",
   ".gitkeep": "plaintext",
   ".mailmap": "plaintext",

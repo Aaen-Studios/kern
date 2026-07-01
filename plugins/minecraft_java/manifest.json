@@ -39,6 +39,12 @@
       "default": "java"
     },
     {
+      "key": "server_jar",
+      "label": "Server JAR",
+      "type": "text",
+      "default": ""
+    },
+    {
       "key": "jvm_args",
       "label": "JVM Arguments",
       "type": "text",
@@ -67,7 +73,7 @@
       "args": [
         "{{userOverrides.jvm_args}}",
         "-jar",
-        "server.jar",
+        "{{userOverrides.server_jar}}",
         "--nogui"
       ]
     },
@@ -76,7 +82,7 @@
       "args": [
         "{{userOverrides.jvm_args}}",
         "-jar",
-        "server.jar",
+        "{{userOverrides.server_jar}}",
         "--nogui"
       ]
     },
@@ -85,7 +91,7 @@
       "args": [
         "{{userOverrides.jvm_args}}",
         "-jar",
-        "server.jar",
+        "{{userOverrides.server_jar}}",
         "--nogui"
       ]
     },
@@ -94,7 +100,7 @@
       "args": [
         "{{userOverrides.jvm_args}}",
         "-jar",
-        "fabric-server-launch.jar",
+        "{{userOverrides.server_jar}}",
         "--nogui"
       ]
     },
@@ -103,19 +109,19 @@
       "args": [
         "{{userOverrides.jvm_args}}",
         "-jar",
-        "quilt-server-launcher.jar",
+        "{{userOverrides.server_jar}}",
         "--nogui"
       ]
     },
     "start.forge": {
-      "command": "kern_start",
+      "command": "{{userOverrides.server_jar}}",
       "args": [
         "nogui"
       ],
       "useShell": true
     },
     "start.neoforge": {
-      "command": "kern_start",
+      "command": "{{userOverrides.server_jar}}",
       "args": [
         "nogui"
       ],

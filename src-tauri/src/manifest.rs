@@ -116,7 +116,7 @@ pub struct LifecycleStep {
     /// runtimes (Forge/NeoForge) whose installer generates `.bat`/`.sh` launch
     /// scripts that can't be `exec`'d as a plain binary. Off by default so
     /// existing manifests spawn exactly as before.
-    #[serde(default)]
+    #[serde(default, rename = "useShell")]
     pub use_shell: bool,
 }
 

@@ -312,19 +312,88 @@ fn run_step(app_handle: &AppHandle, id: &str, step_name: &str) -> Result<(), Str
     let runtime = instance.user_overrides.get("runtime").map(String::as_str);
     let step = lifecycle_step(&manifest, step_name, runtime)?;
 
-    let command = process::resolve_variables(&step.command, &instance.user_overrides);
+    // ── Smart JAR / script detection for start steps ───────────────────
+    // For "start" lifecycle steps, resolve which JAR (or launch script)
+    // exists on disk and inject it into the overrides so the manifest
+    // template {{userOverrides.server_jar}} resolves to a real filename.
+    // For shell-based steps (Forge/NeoForge), detect the actual script
+    // (run.sh, start.sh, etc.) and inject its extension-less name so
+    // build_shell_command resolves it to the platform-appropriate extension.
+    let mut overrides = instance.user_overrides.clone();
+    if step_name == "start" {
+        let root = std::path::Path::new(&instance.path);
+
+        // Check if the user has set a custom jar / script name.
+        let custom_jar = overrides.get("server_jar").map(String::as_str).unwrap_or("").trim();
+        if !custom_jar.is_empty() {
+            // User specified a custom name — validate it exists.
+            if !root.join(custom_jar).exists() {
+                set_status(app_handle, id, "error")?;
+                return Err(format!(
+                    "Server JAR not found: '{custom_jar}'. Check the name in Settings > Server JAR."
+                ));
+            }
+            if step.use_shell {
+                // For shell steps, strip the extension so build_shell_command
+                // can resolve it to the platform-appropriate extension.
+                let bare = strip_script_extension(custom_jar);
+                overrides.insert("server_jar".to_string(), bare);
+            } else {
+                overrides.insert("server_jar".to_string(), custom_jar.to_string());
+            }
+        } else if step.use_shell {
+            // Shell-based step (Forge/NeoForge): detect which script exists.
+            // Try in priority order: kern_start (installer-generated), run, start.
+            // Strip the extension so build_shell_command adds the right one.
+            let detected = detect_script_for_launch(root);
+            match detected {
+                Some(name) => {
+                    let bare = strip_script_extension(&name);
+                    overrides.insert("server_jar".to_string(), bare);
+                }
+                None => {
+                    set_status(app_handle, id, "error")?;
+                    return Err(
+                        "Forge/NeoForge launch scripts not found (run.sh/start.sh). Run 'install' first, or set a custom script name in Settings > Server JAR.".to_string()
+                    );
+                }
+            }
+        } else {
+            // JAR-based step: auto-detect in priority order.
+            let detected = detect_jar_for_launch(root, runtime.unwrap_or("purpur"));
+            match detected {
+                Some(name) => {
+                    overrides.insert("server_jar".to_string(), name);
+                }
+                None => {
+                    set_status(app_handle, id, "error")?;
+                    return Err(
+                        "Server JAR not found. Run 'install' first, or set a custom JAR name in settings.".to_string()
+                    );
+                }
+            }
+        }
+    }
+
+    let command = process::resolve_variables(&step.command, &overrides);
     // Each manifest arg entry is templated, then shell-split so that a single
     // entry like "{{userOverrides.jvm_args}}" (which expands to many -XX flags)
     // becomes individual process arguments instead of one giant quoted string.
     let args: Vec<String> = step
         .args
         .iter()
-        .flat_map(|a| process::shell_split(&process::resolve_variables(a, &instance.user_overrides)))
+        .flat_map(|a| process::shell_split(&process::resolve_variables(a, &overrides)))
         .collect();
 
     // Set a transient status like "starting", "installing", etc.
     let transient = format!("{step_name}-ing");
     set_status(app_handle, id, &transient)?;
+
+    // The Setup-selected JDK, read from the live overrides (the value the user
+    // sees on the Setup page) rather than the possibly-stale `.env` file. Passed
+    // explicitly so shell-based steps (Forge/NeoForge) derive the right
+    // JAVA_HOME / PATH for the same JDK.
+    let java_path = overrides.get("java_path").map(String::as_str);
 
     if let Err(e) = process::launch(
         app_handle,
@@ -333,6 +402,7 @@ fn run_step(app_handle: &AppHandle, id: &str, step_name: &str) -> Result<(), Str
         &command,
         &args,
         step.use_shell,
+        java_path,
     ) {
         // Spawn failed — roll back to error so the UI isn't stuck in a
         // transient state.
@@ -347,6 +417,104 @@ fn run_step(app_handle: &AppHandle, id: &str, step_name: &str) -> Result<(), Str
         set_status(app_handle, id, "running")?;
     }
     Ok(())
+}
+
+/// Strips the extension from a script filename so `build_shell_command` can
+/// resolve it to the platform-appropriate extension (.bat on Windows, .sh on
+/// Unix). E.g. "run.sh" → "run", "start.bat" → "start", "kern_start" → "kern_start".
+fn strip_script_extension(name: &str) -> String {
+    if let Some(stem) = name.strip_suffix(".sh") {
+        stem.to_string()
+    } else if let Some(stem) = name.strip_suffix(".bat") {
+        stem.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Detects which launch script exists for Forge/NeoForge. Checks in priority
+/// order: kern_start (installer-generated), run, start. Returns the full
+/// filename (with extension) of the first match.
+fn detect_script_for_launch(root: &std::path::Path) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    let candidates = ["kern_start.bat", "run.bat", "start.bat"];
+    #[cfg(not(target_os = "windows"))]
+    let candidates = ["kern_start.sh", "run.sh", "start.sh"];
+
+    for name in &candidates {
+        if root.join(name).exists() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Lightweight jar / script detection for pre-launch validation. Checks common
+/// names in priority order based on the runtime. Returns the first filename
+/// that exists on disk, or None if nothing is found.
+fn detect_jar_for_launch(root: &std::path::Path, runtime: &str) -> Option<String> {
+    // Priority 1: server.jar (Vanilla, Paper, Purpur — and commonly used by all)
+    if root.join("server.jar").exists() {
+        return Some("server.jar".to_string());
+    }
+
+    // Priority 2: runtime-specific jars or launch scripts
+    match runtime {
+        "fabric" => {
+            if root.join("fabric-server-launch.jar").exists() {
+                return Some("fabric-server-launch.jar".to_string());
+            }
+        }
+        "quilt" => {
+            if root.join("quilt-server-launcher.jar").exists() {
+                return Some("quilt-server-launcher.jar".to_string());
+            }
+        }
+        "forge" | "neoforge" => {
+            // Forge/NeoForge use generated run scripts, not -jar.
+            #[cfg(target_os = "windows")]
+            {
+                for name in &["run.bat", "start.bat", "kern_start.bat"] {
+                    if root.join(name).exists() {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                for name in &["run.sh", "start.sh", "kern_start.sh"] {
+                    if root.join(name).exists() {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Priority 3: scan for any *.jar (excluding installer/library jars)
+    if let Ok(entries) = std::fs::read_dir(root) {
+        let mut fallbacks: Vec<String> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jar") {
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                if name.ends_with("-installer.jar")
+                    || name.ends_with("-libraries.jar")
+                    || name.contains("installer")
+                {
+                    continue;
+                }
+                fallbacks.push(name);
+            }
+        }
+        fallbacks.sort();
+        if let Some(first) = fallbacks.into_iter().next() {
+            return Some(first);
+        }
+    }
+
+    None
 }
 
 /// Launches a server instance's "start" lifecycle step.
@@ -942,6 +1110,87 @@ pub fn rename_server_path(app_handle: AppHandle, id: String, old_rel_path: Strin
         .map_err(|e| format!("failed to rename '{}' -> '{}': {e}", old_rel_path, new_rel_path))
 }
 
+/// Deletes a file or directory recursively inside an instance's working directory.
+/// Unlike `delete_server_path`, this removes non-empty directories and all their
+/// contents — use with caution.
+#[tauri::command]
+pub fn delete_server_path_recursive(app_handle: AppHandle, id: String, rel_path: String) -> Result<(), String> {
+    let cfg = config::load_config(&app_handle)?;
+    let instance = cfg
+        .servers
+        .get(&id)
+        .ok_or_else(|| format!("server '{id}' not found"))?;
+    let target = resolve_path(&instance.path, &rel_path)?;
+    if !target.exists() {
+        return Err(format!("'{}' does not exist", rel_path));
+    }
+    if target.is_dir() {
+        std::fs::remove_dir_all(&target)
+            .map_err(|e| format!("failed to remove directory '{rel_path}': {e}"))
+    } else {
+        std::fs::remove_file(&target)
+            .map_err(|e| format!("failed to remove file '{rel_path}': {e}"))
+    }
+}
+
+/// Opens a file or directory inside an instance in the system file manager
+/// (Windows Explorer, macOS Finder, Linux xdg-open).
+/// If the path is a file, its parent directory is opened with the file selected
+/// where possible; if it's a directory, the directory itself is opened.
+#[tauri::command]
+pub fn open_server_path(app_handle: AppHandle, id: String, rel_path: String) -> Result<(), String> {
+    let cfg = config::load_config(&app_handle)?;
+    let instance = cfg
+        .servers
+        .get(&id)
+        .ok_or_else(|| format!("server '{id}' not found"))?;
+    let target = resolve_path(&instance.path, &rel_path)?;
+    if !target.exists() {
+        return Err(format!("'{}' does not exist", rel_path));
+    }
+    let path_to_open = if target.is_file() {
+        // Open the parent directory with the file highlighted where possible.
+        target.parent().unwrap_or(&target).to_path_buf()
+    } else {
+        target
+    };
+    open::that(&path_to_open)
+        .map_err(|e| format!("failed to open '{}': {e}", path_to_open.display()))
+}
+
+/// Copies one or more files from absolute source paths into a target directory
+/// inside an instance's working directory. Used for drag-and-drop from the OS
+/// file manager — the frontend passes the dropped file paths here.
+#[tauri::command]
+pub fn copy_files_to_server(
+    app_handle: AppHandle,
+    id: String,
+    source_paths: Vec<String>,
+    target_rel_path: String,
+) -> Result<(), String> {
+    let cfg = config::load_config(&app_handle)?;
+    let instance = cfg
+        .servers
+        .get(&id)
+        .ok_or_else(|| format!("server '{id}' not found"))?;
+    let target_dir = resolve_path(&instance.path, &target_rel_path)?;
+
+    for source in &source_paths {
+        let source_path = std::path::Path::new(source);
+        if !source_path.exists() {
+            return Err(format!("source path '{}' does not exist", source));
+        }
+        let file_name = source_path
+            .file_name()
+            .ok_or_else(|| format!("invalid source path: {}", source))?;
+        let dest = target_dir.join(file_name);
+
+        std::fs::copy(source_path, &dest)
+            .map_err(|e| format!("failed to copy '{}': {}", source, e))?;
+    }
+    Ok(())
+}
+
 /// Lists every installed community plugin (manifest), sorted by id.
 #[tauri::command]
 pub fn list_plugins(app_handle: AppHandle) -> Result<Vec<manifest::Manifest>, String> {
@@ -1323,4 +1572,139 @@ pub fn delete_backup(
     std::fs::remove_file(&archive_path)
         .map_err(|e| format!("failed to delete backup: {e}"))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Smart JAR detection
+// ---------------------------------------------------------------------------
+
+/// Result of server JAR auto-detection.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JarDetectionResult {
+    /// The filename that was found (or the user-specified one).
+    pub detected_jar: Option<String>,
+    /// Whether the resolved file actually exists on disk.
+    pub exists: bool,
+    /// All candidate filenames that were checked, in priority order.
+    pub candidates: Vec<String>,
+    /// Human-readable explanation of what happened.
+    pub message: String,
+}
+
+/// Detects which server JAR (or launch script) exists in the instance directory.
+///
+/// Priority order:
+///   1. User-specified `server_jar` override (if non-empty)
+///   2. `server.jar` — produced by Vanilla, Paper, Purpur
+///   3. `fabric-server-launch.jar` — Fabric
+///   4. `quilt-server-launcher.jar` — Quilt
+///   5. `run.sh` / `run.bat` — Forge / NeoForge generated scripts
+///   6. Any `*.jar` in the root (excluding installer/library jars)
+///
+/// Returns a structured result so the frontend can display status without
+/// needing to duplicate the detection logic.
+#[tauri::command]
+pub fn detect_server_jar(app_handle: AppHandle, id: String) -> Result<JarDetectionResult, String> {
+    let cfg = config::load_config(&app_handle)?;
+    let instance = cfg
+        .servers
+        .get(&id)
+        .ok_or_else(|| format!("server '{id}' not found"))?;
+
+    let root = std::path::Path::new(&instance.path);
+    let runtime = instance.user_overrides.get("runtime").map(String::as_str).unwrap_or("purpur");
+
+    // If the user explicitly set a jar name, just check that one.
+    if let Some(custom) = instance.user_overrides.get("server_jar") {
+        let custom = custom.trim();
+        if !custom.is_empty() {
+            let exists = root.join(custom).exists();
+            return Ok(JarDetectionResult {
+                detected_jar: Some(custom.to_string()),
+                exists,
+                candidates: vec![custom.to_string()],
+                message: if exists {
+                    format!("Using custom JAR: {custom}")
+                } else {
+                    format!("Custom JAR not found: {custom}")
+                },
+            });
+        }
+    }
+
+    // Build the candidate list based on runtime.
+    let mut candidates: Vec<String> = vec!["server.jar".to_string()];
+    match runtime {
+        "fabric" => candidates.push("fabric-server-launch.jar".to_string()),
+        "quilt" => candidates.push("quilt-server-launcher.jar".to_string()),
+        "forge" | "neoforge" => {
+            // Forge/NeoForge don't use -jar; they use generated run scripts.
+            #[cfg(target_os = "windows")]
+            {
+                candidates.push("kern_start.bat".to_string());
+                candidates.push("run.bat".to_string());
+                candidates.push("start.bat".to_string());
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                candidates.push("kern_start.sh".to_string());
+                candidates.push("run.sh".to_string());
+                candidates.push("start.sh".to_string());
+            }
+        }
+        _ => {
+            // Vanilla/Paper/Purpur already have server.jar; add common alternatives.
+        }
+    }
+
+    // Check each candidate in order.
+    for name in &candidates {
+        if root.join(name).exists() {
+            let found = name.clone();
+            return Ok(JarDetectionResult {
+                detected_jar: Some(found.clone()),
+                exists: true,
+                candidates,
+                message: format!("Found: {found}"),
+            });
+        }
+    }
+
+    // Final fallback: scan for any *.jar (excluding installers and libraries).
+    if let Ok(entries) = std::fs::read_dir(root) {
+        let mut fallbacks: Vec<String> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jar") {
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                // Skip installer jars and anything in subdirectories.
+                if name.ends_with("-installer.jar")
+                    || name.ends_with("-libraries.jar")
+                    || name.contains("installer")
+                {
+                    continue;
+                }
+                fallbacks.push(name);
+            }
+        }
+        // Sort alphabetically so the result is deterministic.
+        fallbacks.sort();
+        if let Some(first) = fallbacks.first() {
+            candidates.push(first.clone());
+            return Ok(JarDetectionResult {
+                detected_jar: Some(first.clone()),
+                exists: true,
+                candidates,
+                message: format!("Found: {first}"),
+            });
+        }
+    }
+
+    Ok(JarDetectionResult {
+        detected_jar: None,
+        exists: false,
+        candidates,
+        message: "No server JAR found. Run 'install' first, or set a custom JAR name in settings.".to_string(),
+    })
 }
