@@ -1,8 +1,9 @@
 {
   "id": "minecraft_java",
   "displayName": "Minecraft Java Server",
+  "description": "Run and manage Minecraft Java Edition servers with support for Vanilla, Paper, Purpur, Fabric, Forge, NeoForge, and Quilt. Configure JVM arguments, accept EULA, and monitor server performance.",
   "version": "1.2.0",
-  "author": "kern/community",
+  "author": "kern/sample",
   "uiEntry": "dist/index.js",
   "configSchema": [
     {

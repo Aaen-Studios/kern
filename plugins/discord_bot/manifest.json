@@ -1,6 +1,7 @@
 {
   "id": "discord_bot",
   "displayName": "Discord Bot Manager",
+  "description": "Create and manage Discord bots with multiple runtime support (Node.js, Bun, Deno, Rust). Configure tokens, set up event handlers, and deploy your bot with zero-config scaffolding.",
   "version": "1.2.0",
   "author": "kern/sample",
   "uiEntry": "dist/index.js",

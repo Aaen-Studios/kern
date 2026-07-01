@@ -23,6 +23,7 @@ export function PluginManager({ onBack, preselectedKernPath }: PluginManagerProp
   const { plugins, loading, error: loadError, refresh } = usePlugins();
   const [installOpen, setInstallOpen] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [expandedPluginId, setExpandedPluginId] = useState<string | null>(null);
 
   // Auto-open installer if a .kern path was passed (deep link from file double-click)
   const [preselectedPath, setPreselectedPath] = useState<string | null>(
@@ -138,31 +139,53 @@ export function PluginManager({ onBack, preselectedKernPath }: PluginManagerProp
             </thead>
             <tbody>
               {plugins.map((plugin) => (
-                <tr
-                  key={plugin.id}
-                  className="border-b border-grid-bounds/50 hover:bg-bg-core transition-colors"
-                >
-                  <td className="px-4 py-2.5 text-zinc-200 font-medium">
-                    {plugin.displayName}
-                  </td>
-                  <td className="px-4 py-2.5 text-zinc-500 font-mono">
-                    {plugin.id}
-                  </td>
-                  <td className="px-4 py-2.5 text-zinc-400">
-                    {plugin.version}
-                  </td>
-                  <td className="px-4 py-2.5 text-zinc-400">
-                    {plugin.author}
-                  </td>
-                  <td className="px-4 py-2.5 text-right">
-                    <button
-                      onClick={() => setPendingUninstall(plugin)}
-                      className="px-2 py-1 text-[10px] text-fault-vector border border-fault-vector/40 hover:bg-fault-vector/10 font-semibold transition-colors uppercase tracking-wider"
+                <>
+                  <tr key={plugin.id}
+                    onClick={() =>
+                      setExpandedPluginId(
+                        expandedPluginId === plugin.id ? null : plugin.id
+                      )
+                    }>
+                    <td
+                      className="border-b border-grid-bounds/50 hover:bg-bg-core transition-colors cursor-pointer"
                     >
-                      uninstall
-                    </button>
-                  </td>
-                </tr>
+                      <div className="flex items-center justify-between px-4 py-2.5">
+                        <span className="text-zinc-200 font-medium">
+                          {plugin.displayName}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="px-4 py-2.5 text-zinc-500 font-mono">
+                      {plugin.id}
+                    </td>
+                    <td className="px-4 py-2.5 text-zinc-400">
+                      {plugin.version}
+                    </td>
+                    <td className="px-4 py-2.5 text-zinc-400">
+                      {plugin.author}
+                    </td>
+                    <td className="px-4 py-2.5 text-right" colSpan={2}>
+                      <button
+                        onClick={() => setPendingUninstall(plugin)}
+                        className="px-2 py-1 text-[10px] text-fault-vector border border-fault-vector/40 hover:bg-fault-vector/10 font-semibold transition-colors uppercase tracking-wider"
+                      >
+                        uninstall
+                      </button>
+                    </td>
+                  </tr>
+                  <tr>
+                    {expandedPluginId === plugin.id && plugin.description && (
+                      <>
+                        <div className="px-4 pb-3 -mt-1 fixed">
+                          <p className="text-[11px] text-zinc-400 pl-2 border-l-2 border-signal-high">
+                            {plugin.description}
+                          </p>
+                        </div>
+                        <p className="w-full h-6"></p>
+                      </>
+                    )}
+                  </tr>
+                </>
               ))}
             </tbody>
           </table>
