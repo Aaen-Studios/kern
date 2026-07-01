@@ -313,14 +313,20 @@ fn run_step(app_handle: &AppHandle, id: &str, step_name: &str) -> Result<(), Str
     let step = lifecycle_step(&manifest, step_name, runtime)?;
 
     // ── Smart JAR / script detection for start steps ───────────────────
-    // For "start" lifecycle steps, resolve which JAR (or launch script)
-    // exists on disk and inject it into the overrides so the manifest
-    // template {{userOverrides.server_jar}} resolves to a real filename.
-    // For shell-based steps (Forge/NeoForge), detect the actual script
-    // (run.sh, start.sh, etc.) and inject its extension-less name so
-    // build_shell_command resolves it to the platform-appropriate extension.
+    // For "start" lifecycle steps that template {{userOverrides.server_jar}}
+    // (i.e. JAR-based servers like Minecraft), resolve which JAR or launch
+    // script exists on disk and inject it into the overrides so the manifest
+    // template resolves to a real filename. For shell-based steps (Forge /
+    // NeoForge), detect the actual script (run.sh, start.sh, etc.) and inject
+    // its extension-less name so build_shell_command picks the right extension.
+    //
+    // Plugins whose start step doesn't reference server_jar (e.g. the Discord
+    // bot, which runs `node index.js` / `cargo run`) are left untouched — the
+    // plugin fully owns the command.
+    let step_needs_jar = step.command.contains("server_jar")
+        || step.args.iter().any(|a| a.contains("server_jar"));
     let mut overrides = instance.user_overrides.clone();
-    if step_name == "start" {
+    if step_name == "start" && step_needs_jar {
         let root = std::path::Path::new(&instance.path);
 
         // Check if the user has set a custom jar / script name.
