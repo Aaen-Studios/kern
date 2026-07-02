@@ -401,6 +401,16 @@ Function CreateShortcuts
     Return
   ${EndIf}
 
+  ; CreateShortCut and SetLnkAppUserModelId both use COM (IShellLink /
+  ; IPersistFile). In the interactive (wizard) install this function runs on a
+  ; BgWorker thread, which — unlike NSIS's main thread — has no COM apartment
+  ; initialized. Without this call, CreateShortCut silently fails on that thread
+  ; (the error is swallowed by the ClearErrors guards below), leaving an empty
+  ; Start Menu folder and no Desktop icon. CoInitializeEx is per-thread and
+  ; ref-counted, so on the main thread (silent install) it simply returns
+  ; S_FALSE and the matching CoUninitialize below keeps the count balanced.
+  System::Call 'ole32::CoInitializeEx(p 0, i 2) i.r0' ; COINIT_APARTMENTTHREADED
+
   ${If} $hInstallDlg != ""
     nsNiuniuSkin::SetControlAttribute $hInstallDlg "progress_tip" "text" "Creating shortcuts..."
   ${EndIf}
@@ -435,6 +445,9 @@ Function CreateShortcuts
 
   ; Notify Explorer so shortcuts appear immediately
   System::Call 'shell32.dll::SHChangeNotify(i 0x8000000, i 0, p 0, p 0)'
+
+  ; Balance the CoInitializeEx from the top of this function.
+  System::Call 'ole32::CoUninitialize()'
 
   ${If} $hInstallDlg != ""
     nsNiuniuSkin::SetControlAttribute $hInstallDlg "progress_pos" "text" "90%"

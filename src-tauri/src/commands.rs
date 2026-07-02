@@ -389,6 +389,53 @@ fn run_step(app_handle: &AppHandle, id: &str, step_name: &str) -> Result<(), Str
         ));
     }
 
+    // ── Custom (barebones) instances ────────────────────────────────────
+    // "custom" instances have no plugin manifest — the user provides a
+    // start_command override directly. All other lifecycle steps are not
+    // supported (no install, etc.).
+    if instance.server_type == "custom" {
+        if step_name != "start" {
+            return Err(
+                "custom instances have no lifecycle steps — run commands directly in the terminal"
+                    .to_string(),
+            );
+        }
+        let start_cmd = instance
+            .user_overrides
+            .get("start_command")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "custom instances require a start_command override — set it in instance settings"
+                    .to_string()
+            })?;
+        let overrides = instance.user_overrides.clone();
+        let mut parts = process::shell_split(&process::resolve_variables(start_cmd, &overrides));
+        if parts.is_empty() {
+            return Err("start_command is empty".to_string());
+        }
+        let command = parts.remove(0);
+        let args = parts;
+
+        let transient = format!("{step_name}-ing");
+        set_status(app_handle, id, &transient)?;
+
+        if let Err(e) = process::launch(
+            app_handle,
+            id,
+            std::path::Path::new(&instance.path),
+            &command,
+            &args,
+            false, // use_shell
+            None,  // java_path
+        ) {
+            set_status(app_handle, id, "error")?;
+            return Err(e);
+        }
+        set_status(app_handle, id, "running")?;
+        return Ok(());
+    }
+
     let manifest_path = manifest_path_for(app_handle, &instance.server_type)?;
     let manifest = manifest::load(&manifest_path)?;
 
