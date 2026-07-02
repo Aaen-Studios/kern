@@ -191,14 +191,23 @@ export function ServerDetailView({
         await install();
         await handleInstalled();
       } else {
-        // Not a lifecycle keyword — pipe to the running process's stdin.
+        // Not a lifecycle keyword — pipe to the running process's stdin, or
+        // run as an ad-hoc command in the instance directory when idle.
         if (running) {
           void invoke("write_stdin_to_instance", {
             id: server.id,
             data: trimmed + "\n",
           });
         } else {
-          pushLine("  (no running process — use 'start' to launch)");
+          // Ad-hoc terminal command: split into command + args and fire.
+          const parts = trimmed.split(/\s+/);
+          if (parts.length > 0 && parts[0]) {
+            void invoke("run_terminal_command", {
+              id: server.id,
+              command: parts[0],
+              args: parts.slice(1),
+            });
+          }
         }
       }
       inputHistoryRef.current.push(trimmed);

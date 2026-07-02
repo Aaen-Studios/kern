@@ -125,33 +125,18 @@ function AppInner() {
   const { uiState, setView, setSortPreference } = useUiState();
   const bridgeRef = useContext(SelectedIdBridgeContext);
 
-  // Deep link state - .kern file opened via double-click
+  // Deep link state - .kern file path received via kern:// protocol or
+  // .kern file-association double-click. The Rust backend resolves the
+  // URL to a local file path before emitting this event.
   const [deepLinkedKernPath, setDeepLinkedKernPath] = useState<string | null>(null);
 
   // Listen for deep link events from Rust backend
   useEffect(() => {
     const unlisten = listen<string>("kern://open-install", (event) => {
-      // The URL format is kern://install?url=file%3A%2F%2F...
-      const url = event.payload;
-      try {
-        const parsed = new URL(url);
-        const filePath = parsed.searchParams.get("url");
-        if (filePath) {
-          // Decode the file:// URL to get the actual path
-          let decodedPath = decodeURIComponent(filePath);
-          // Remove file:// prefix on Windows
-          if (decodedPath.startsWith("file://")) {
-            decodedPath = decodedPath.replace("file://", "");
-          }
-          // On Windows, remove the leading slash
-          if (decodedPath.match(/^[/\\]/)) {
-            decodedPath = decodedPath.substring(1);
-          }
-          setDeepLinkedKernPath(decodedPath);
-          setViewLocal({ kind: "plugins" });
-        }
-      } catch {
-        // Ignore malformed URLs
+      const path = event.payload;
+      if (path) {
+        setDeepLinkedKernPath(path);
+        setViewLocal({ kind: "plugins" });
       }
     });
     return () => {

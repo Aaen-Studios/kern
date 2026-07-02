@@ -207,8 +207,7 @@ export function useServerControl(
     setError(null);
     try {
       await invoke("stop_server_instance", { id: serverId });
-      setRunning(false);
-      onChangeRef.current?.();
+      // Stop runs async in background; the status event will set running=false.
     } catch (e) {
       setError(String(e));
     }

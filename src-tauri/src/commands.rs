@@ -844,15 +844,52 @@ pub fn restart_server_instance(app_handle: AppHandle, id: String) -> Result<(), 
 
 /// Stops a running instance. Idempotent — Ok if it wasn't running.
 ///
-/// Asks the server to shut down gracefully first (e.g. Minecraft's `stop`
-/// command flushes chunks and saves the world), and only hard-kills if it
-/// hasn't exited within [`GRACEFUL_STOP_TIMEOUT`]. This avoids rollbacks to the
-/// last autosave that a raw process kill would cause.
+/// Runs asynchronously (fire-and-forget) so the UI isn't blocked. The
+/// actual stop logic runs in a background thread:
+/// - For "custom" instances: if a `stop_command` override is set, sends it to stdin;
+///   otherwise hard-kills immediately.
+/// - For plugin instances: graceful stop with "stop" command and 15s timeout.
 #[tauri::command]
 pub fn stop_server_instance(app_handle: AppHandle, id: String) -> Result<(), String> {
     set_status(&app_handle, &id, "stopping")?;
-    process::stop_graceful(&app_handle, &id, GRACEFUL_STOP_TIMEOUT)?;
-    set_status(&app_handle, &id, "stopped")?;
+
+    let handle = app_handle.clone();
+    let id2 = id.clone();
+
+    std::thread::spawn(move || {
+        // 1. Check if the process is even tracked in the registry.
+        if !process::is_running(&handle, &id2) {
+            let _ = set_status(&handle, &id2, "stopped");
+            return;
+        }
+
+        // 2. Load the instance config to detect custom type + optional stop_command.
+        let is_custom = config::load_config(&handle)
+            .ok()
+            .and_then(|cfg| cfg.servers.get(&id2).cloned())
+            .map(|s| s.server_type == "custom")
+            .unwrap_or(false);
+
+        // 3. For custom instances: send stop_command (if set) then hard kill.
+        if is_custom {
+            let stop_cmd = config::load_config(&handle)
+                .ok()
+                .and_then(|cfg| cfg.servers.get(&id2).cloned())
+                .and_then(|s| s.user_overrides.get("stop_command").cloned());
+            if let Some(cmd) = stop_cmd {
+                let _ = process::write_stdin(&handle, &id2, &cmd);
+            }
+            let _ = process::stop(&handle, &id2);
+            let _ = set_status(&handle, &id2, "stopped");
+            eprintln!("[stop] custom instance '{id2}' killed");
+            return;
+        }
+
+        // 4. Plugin instances: graceful stop with timeout.
+        let _ = process::stop_graceful(&handle, &id2, GRACEFUL_STOP_TIMEOUT);
+        let _ = set_status(&handle, &id2, "stopped");
+    });
+
     Ok(())
 }
 
@@ -969,6 +1006,98 @@ pub fn run_instance_command(
         set_status(&app_handle, &id, "error")?;
         Err(format!("command exited with code {code}"))
     }
+}
+
+/// Runs a command inside an instance's working directory and streams its output
+/// to the terminal, but does NOT wait for it to finish — returns immediately.
+///
+/// This is the fire-and-forget counterpart to `run_instance_command`. Output
+/// lines are forwarded to `log:<id>:stream` events and appended to
+/// `latest.log` in real-time. The command runs in a background thread; there
+/// is no status change on exit since the process was never "running" from the
+/// perspective of the lifecycle system.
+///
+/// Useful for ad-hoc terminal use (`npm install`, `git status`, `npx next build`)
+/// when no lifecycle process is active.
+#[tauri::command]
+pub fn run_terminal_command(
+    app_handle: AppHandle,
+    id: String,
+    command: String,
+    args: Vec<String>,
+) -> Result<(), String> {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command as StdCommand, Stdio};
+    use tauri::Emitter;
+
+    let cfg = config::load_config(&app_handle)?;
+    let instance = cfg
+        .servers
+        .get(&id)
+        .ok_or_else(|| format!("server '{id}' not found"))?
+        .clone();
+    if instance.is_orphaned {
+        return Err(format!(
+            "instance '{id}' is orphaned (path missing): {}",
+            instance.path
+        ));
+    }
+
+    let working_dir = std::path::Path::new(&instance.path);
+    let log_path = working_dir.join("latest.log");
+
+    let mut cmd = StdCommand::new(&command);
+    cmd.current_dir(working_dir);
+    cmd.args(&args);
+    let env_path = working_dir.join(".env");
+    for (k, v) in parse_env_file(&env_path) {
+        cmd.env(k, v);
+    }
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    process::suppress_window(&mut cmd);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn '{command}': {e}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "spawned child has no stdout pipe".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "spawned child has no stderr pipe".to_string())?;
+
+    let event_name = format!("log:{id}:stream");
+
+    // Spawn background thread to read + forward output while this function
+    // returns immediately.
+    let handle_out = app_handle.clone();
+    let event_out = event_name.clone();
+    let log_path_out = log_path.clone();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().flatten() {
+            let stamped = forward_to_log(&handle_out, &event_out, &log_path_out, &line);
+            let _ = handle_out.emit(&event_out, stamped);
+        }
+    });
+
+    let handle_err = app_handle.clone();
+    let event_err = event_name;
+    let log_path_err = log_path;
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().flatten() {
+            let stamped = forward_to_log(&handle_err, &event_err, &log_path_err, &line);
+            let _ = handle_err.emit(&event_err, stamped);
+        }
+    });
+
+    Ok(())
 }
 
 /// Formats the current wall-clock time as `[HH:MM:SS]`.

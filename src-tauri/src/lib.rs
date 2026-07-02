@@ -13,7 +13,7 @@ mod tray;
 mod ui_state;
 mod window_state;
 
-use tauri::{Listener, Manager, WindowEvent};
+use tauri::{Emitter, Listener, Manager, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -25,17 +25,25 @@ pub fn run() {
     // instead of starting a duplicate app.
     #[cfg(not(target_os = "macos"))]
     {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
                 let _ = w.unminimize();
                 let _ = w.set_focus();
+            }
+            // Forward any deep link URL or .kern file path from argv
+            for arg in &argv {
+                if arg.starts_with("kern://") || arg.ends_with(".kern") {
+                    handle_deep_link(app, arg);
+                    break;
+                }
             }
         }));
     }
 
     builder
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         // OS-login autostart. The `--autostart` arg lets setup distinguish an
@@ -95,6 +103,17 @@ pub fn run() {
             let refresh_handle = handle.clone();
             handle.listen("kern://running-set-changed", move |_event| {
                 tray::refresh_menu(&refresh_handle);
+            });
+
+            // Listen for `kern://` deep-link URLs dispatched by the OS via
+            // tauri-plugin-deep-link. Fires both on fresh launch (when the app
+            // starts in response to a URL click) and when a running instance
+            // receives a second URL (the plugin handles second-instance routing
+            // on Windows via the single-instance plugin).
+            let deep_link_handle = handle.clone();
+            handle.listen("deep-link://new-url", move |event| {
+                let url = event.payload();
+                handle_deep_link(&deep_link_handle, url);
             });
 
             // Auto-start any instances flagged `autoStart`. Non-orphaned only,
@@ -193,6 +212,7 @@ pub fn run() {
             commands::create_plugin_package,
             commands::uninstall_plugin,
             commands::run_instance_command,
+            commands::run_terminal_command,
             download::download_url,
             download::fetch_mc_versions,
             download::resolve_forge_version,
@@ -209,4 +229,143 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ─── Deep link handling ──────────────────────────────────────────────────
+//
+// Dispatched by tauri-plugin-deep-link (on fresh launch) or the
+// single-instance callback (on second-instance handoff).  Supports two forms:
+//
+//   kern://install?url=<encoded-url>&id=<plugin-id>&v=<version>
+//     → url may be a file:// path (local .kern) or an https:// URL (remote).
+//       id and v are forwarded for tracking but not currently used.
+//
+//   <raw-path>.kern
+//     → direct file path passed by the .kern file-association handler.
+//
+// In all cases the resolved file path is emitted as "kern://open-install",
+// which the frontend listens for to open the plugin install dialog.
+
+/// Handles an incoming deep-link URL or file path.
+fn handle_deep_link(app: &tauri::AppHandle, payload: &str) {
+    // Sanitize: trim whitespace and null bytes that sometimes trail Windows
+    // protocol-invocation strings.
+    let payload = payload.trim().trim_end_matches('\0');
+
+    if let Some(query) = payload.strip_prefix("kern://install?") {
+        // Parse query parameters — we specifically look for `url=` but also
+        // capture `id` and `v` for potential future tracking/analytics.
+        let mut file_url: Option<String> = None;
+        for pair in query.split('&') {
+            let mut parts = pair.splitn(2, '=');
+            match (parts.next(), parts.next()) {
+                (Some("url"), Some(val)) => file_url = Some(val.to_string()),
+                (Some("id") | Some("v"), Some(_val)) => {
+                    // Reserved for future analytics use
+                }
+                _ => {}
+            }
+        }
+
+        match file_url {
+            Some(encoded) => {
+                let decoded = percent_decode(&encoded);
+                let path = normalize_path(&decoded);
+
+                if path.starts_with("http://") || path.starts_with("https://") {
+                    match download_to_temp(&path) {
+                        Ok(temp_path) => {
+                            let _ = app.emit("kern://open-install", temp_path);
+                        }
+                        Err(e) => {
+                            eprintln!("[deep-link] failed to download {path}: {e}");
+                        }
+                    }
+                } else {
+                    let _ = app.emit("kern://open-install", path);
+                }
+            }
+            None => {
+                eprintln!("[deep-link] no 'url' parameter in: {payload}");
+            }
+        }
+    } else if payload.ends_with(".kern") {
+        // Raw file path from .kern file-association double-click
+        let _ = app.emit("kern://open-install", payload.to_string());
+    } else {
+        eprintln!("[deep-link] unrecognised payload: {payload}");
+    }
+}
+
+/// Normalize a file-path string: strip `file://` prefix and, on Windows,
+/// remove the leading `/` that appears before the drive letter (e.g.
+/// `/C:/path` → `C:/path`).
+fn normalize_path(path: &str) -> String {
+    let mut p = if let Some(rest) = path.strip_prefix("file://") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    };
+    // Strip leading slash on Windows (e.g. /C:/path -> C:/path)
+    #[cfg(windows)]
+    if p.starts_with('/') {
+        p = p[1..].to_string();
+    }
+    p
+}
+
+/// Minimal percent-decoder that handles URL-encoded characters (%XX).
+fn percent_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                out.push(byte as char);
+            } else {
+                out.push('%');
+                out.push_str(&hex);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Download a remote .kern file to a temporary location so the install
+/// pipeline can read it as a local path.
+fn download_to_temp(url: &str) -> Result<String, String> {
+    let resp = ureq::get(url)
+        .call()
+        .map_err(|e| format!("HTTP request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {} for '{url}'", resp.status().as_u16()));
+    }
+
+    // Create a dedicated temp directory that persists long enough for the
+    // install flow to read the file (we do not auto-clean; the OS will
+    // reclaim it on next boot or the installer deletes after copy).
+    let temp_dir = std::env::temp_dir().join("kern-deep-link");
+    std::fs::create_dir_all(&temp_dir)
+        .map_err(|e| format!("failed to create temp dir: {e}"))?;
+
+    // Derive a filename from the URL, falling back to a random name.
+    let filename = url
+        .split('/')
+        .next_back()
+        .filter(|n| n.ends_with(".kern"))
+        .unwrap_or("plugin.kern");
+    let dest = temp_dir.join(filename);
+
+    let mut file = std::fs::File::create(&dest)
+        .map_err(|e| format!("failed to create '{:?}': {e}", dest))?;
+
+    let mut reader = std::io::BufReader::new(resp.into_body().into_reader());
+    std::io::copy(&mut reader, &mut file)
+        .map_err(|e| format!("failed to write '{:?}': {e}", dest))?;
+
+    Ok(dest.to_string_lossy().to_string())
 }

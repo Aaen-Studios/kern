@@ -21,6 +21,7 @@
     "opener:default",
     "dialog:default",
     "updater:default",
+    "deep-link:default",
     {
       "identifier": "shell:allow-execute",
       "allow": [

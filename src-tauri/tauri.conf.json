@@ -55,6 +55,11 @@
     }
   },
   "plugins": {
+    "deepLink": {
+      "desktop": {
+        "schemes": ["kern"]
+      }
+    },
     "updater": {
       "endpoints": [
         "https://github.com/ellipog/kern/releases/latest/download/update.json"

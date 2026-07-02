@@ -114,6 +114,22 @@ impl ProcessRegistry {
             Err(_) => Vec::new(),
         }
     }
+
+    /// Detaches all running processes: closes stdin and drops the child handle
+    /// without killing. The processes continue running (orphaned).
+    /// Used during app exit to leave server processes alive.
+    pub fn detach_all(&self) {
+        if let Ok(mut map) = self.processes.lock() {
+            for (_id, proc) in map.drain() {
+                // Close stdin so the process won't receive a shutdown command.
+                if let Ok(mut guard) = proc.stdin.lock() {
+                    drop(guard.take());
+                }
+                // Dropping the child handle without kill/wait lets the process
+                // continue running as an orphan.
+            }
+        }
+    }
 }
 
 /// Resolves `{{userOverrides.<key>}}` placeholders in a template string.
@@ -685,10 +701,19 @@ pub fn stop(app_handle: &AppHandle, instance_id: &str) -> Result<(), String> {
         map.remove(instance_id)
     };
     if let Some(proc) = removed {
-        // Killing the child closes its stdout pipe → the stdout reader sees EOF
-        // and exits. We don't wait here (the reader thread owns teardown); a
-        // kill without a following wait just orphans the child, which the OS
-        // reaps, but to be tidy try to take the child and kill+wait it.
+        // 1. Kill the process tree (taskkill on Windows, direct kill on Unix).
+        //    This ensures npm/npx wrappers (which spawn child node.exe processes)
+        //    are fully terminated rather than leaving orphans.
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &proc.pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+
+        // 2. Kill the direct child handle so Rust's `Child` doesn't hang.
         let mut child = proc.child.into_inner().expect("child lock poisoned");
         let _ = child.kill();
         let _ = child.wait();

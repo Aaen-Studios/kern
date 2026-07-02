@@ -12,8 +12,6 @@
 //! Pattern adapted from the galdr app: a single-frameless-window host that
 //! lives in the tray, with `decorations: false` + custom titlebar.
 
-use std::time::Duration;
-
 use tauri::{
     AppHandle, Emitter, Manager,
     menu::{Menu, MenuItem, PredefinedMenuItem, MenuEvent},
@@ -24,11 +22,6 @@ use crate::commands::RunningServerInfo;
 use crate::config;
 use crate::process;
 use crate::window_state;
-
-/// How long the tray "Quit" path waits for each running server to shut down
-/// gracefully before forcing exit. Mirrors the command-level stop timeout so
-/// a world save gets the same window it would from the Stop button.
-const QUIT_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Menu item id prefix for the per-server entries. The instance id follows:
 /// `show:<server-id>`.
@@ -223,9 +216,11 @@ fn bullet() -> &'static str {
     "●"
 }
 
-/// Real exit path — graceful-stop every running server, then quit. This is the
-/// only place the app fully exits; the window close button hides to tray
-/// instead (see `lib::run`'s CloseRequested handler).
+/// Real exit path — detach every running server, then quit. Unlike the Stop
+/// button (which sends a graceful "stop" command to let Minecraft save its
+/// world), quitting kern simply closes the pipe handles and exits, leaving
+/// the server processes running. They may get ERROR_BROKEN_PIPE on their
+/// next stdout/stderr write but otherwise continue unaffected.
 pub fn quit(app: &AppHandle) {
     // Capture window geometry first (this path bypasses CloseRequested, where
     // geometry is normally saved) so the next launch reopens in the same spot.
@@ -234,12 +229,10 @@ pub fn quit(app: &AppHandle) {
             let _ = window_state::save(app, &state);
         }
     }
+    // Detach all running processes: close stdin and drop the child handles
+    // without killing, so servers outlive the app. The `generations` map is
+    // also cleared to break the registry's link to these processes.
     let registry: tauri::State<'_, process::ProcessRegistry> = app.state();
-    let ids = registry.running_ids();
-    for id in ids {
-        // Best-effort: a hung server shouldn't block quit. Each server gets
-        // the same graceful window the Stop button grants.
-        let _ = process::stop_graceful(app, &id, QUIT_STOP_TIMEOUT);
-    }
+    registry.detach_all();
     app.exit(0);
 }
