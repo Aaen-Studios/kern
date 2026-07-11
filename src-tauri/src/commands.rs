@@ -59,9 +59,11 @@ pub struct NewServerInput {
 /// Creates a new server instance and returns the persisted record (with its
 /// generated id and resolved orphaned status).
 ///
-/// After persisting, the plugin's `scaffold` files are written into the
-/// instance directory — so the path exists immediately and the instance isn't
-/// orphaned on first load. Scaffolding is best-effort and never blocks creation.
+/// The instance directory is created unconditionally (including any missing
+/// parents) before scaffolding, so the path always exists and the instance is
+/// never orphaned on first load — even for "custom" types or plugins without
+/// scaffold files. After persisting, the plugin's `scaffold` files are written
+/// into the directory. Scaffolding is best-effort and never blocks creation.
 #[tauri::command]
 pub fn create_server(
     app_handle: AppHandle,
@@ -83,6 +85,14 @@ pub fn create_server(
     cfg.servers.insert(instance.id.clone(), instance.clone());
     config::save_config(&app_handle, &cfg)?;
 
+    // Ensure the instance working directory exists (and any missing parents).
+    // This is what guarantees `is_orphaned` stays false on the first load
+    // regardless of whether the plugin provides scaffolding. If this fails we
+    // propagate the error: without the directory, scaffolding and the .env
+    // write below would silently no-op and the instance would be orphaned.
+    std::fs::create_dir_all(&instance.path)
+        .map_err(|e| format!("failed to create instance directory '{}': {e}", instance.path))?;
+
     // Scaffold starter files from the plugin manifest (if installed + declared).
     // Best-effort: a missing/unknown plugin just leaves the folder empty.
     if let Ok(manifest_path) = manifest_path_for(&app_handle, &instance.server_type) {
@@ -103,6 +113,9 @@ pub fn create_server(
     // overrides — no point writing an empty file.
     if !instance.user_overrides.is_empty() {
         let env_path = std::path::Path::new(&instance.path).join(".env");
+        if env_path.exists() {
+            return Ok(instance);
+        }
         let content: String = instance
             .user_overrides
             .iter()
@@ -2331,3 +2344,226 @@ pub fn detect_server_jar(app_handle: AppHandle, id: String) -> Result<JarDetecti
         message: "No server JAR found. Run 'install' first, or set a custom JAR name in settings.".to_string(),
     })
 }
+
+
+// ---------------------------------------------------------------------------
+// File search
+// ---------------------------------------------------------------------------
+
+/// A single search match result.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchMatch {
+    /// Relative path from the instance root.
+    pub rel_path: String,
+    /// Line number where the match was found (None for filename-only matches).
+    pub line_number: Option<u32>,
+    /// The matching line content (truncated if long).
+    pub line_preview: Option<String>,
+}
+
+/// Searches for a query across files in an instance's working directory.
+///
+/// Modes:
+///   - "filenames": Match against file/directory names only
+///   - "contents": Match against file contents (text files only)
+///
+/// Supports include/exclude glob patterns for filtering.
+#[tauri::command]
+pub fn search_files(
+    app_handle: AppHandle,
+    id: String,
+    query: String,
+    mode: String,
+    include: Option<String>,
+    exclude: Option<String>,
+) -> Result<Vec<SearchMatch>, String> {
+    let cfg = config::load_config(&app_handle)?;
+    let instance = cfg
+        .servers
+        .get(&id)
+        .ok_or_else(|| format!("server '{}' not found", id))?;
+    let root = std::path::Path::new(&instance.path);
+
+    let include_pattern = include.as_deref().unwrap_or("*");
+    let exclude_patterns: Vec<&str> = exclude
+        .as_deref()
+        .map(|e| e.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+
+    let mut results: Vec<SearchMatch> = Vec::new();
+    let query_lower = query.to_lowercase();
+
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let rel_path = path.strip_prefix(root)
+            .map(|p| p.to_string_lossy().replace('\', "/"))
+            .unwrap_or_default();
+
+        // Simple glob matching: * matches any characters
+        let path_lower = rel_path.to_lowercase();
+        let matches_include = if include_pattern == "*" {
+            true
+        } else {
+            let pattern_lower = include_pattern.to_lowercase();
+            if pattern_lower.contains('*') {
+                let regex_str: String = pattern_lower
+                    .replace('.', r"\.")
+                    .replace('?', ".")
+                    .replace('*', ".*");
+                regex::Regex::new(&format!("^{}$", regex_str))
+                    .map(|re| re.is_match(&path_lower))
+                    .unwrap_or(false)
+            } else {
+                path_lower.contains(&pattern_lower)
+            }
+        };
+
+        if !matches_include {
+            continue;
+        }
+
+        // Check exclude patterns
+        let matches_exclude = exclude_patterns.iter().any(|p| {
+            if p == "*" || p.is_empty() {
+                false
+            } else {
+                let pattern_lower = p.to_lowercase();
+                if pattern_lower.contains('*') {
+                    let regex_str: String = pattern_lower
+                        .replace('.', r"\.")
+                        .replace('?', ".")
+                        .replace('*', ".*");
+                    regex::Regex::new(&format!("^{}$", regex_str))
+                        .map(|re| re.is_match(&path_lower))
+                        .unwrap_or(false)
+                } else {
+                    path_lower.contains(&pattern_lower)
+                }
+            }
+        });
+
+        if matches_exclude {
+            continue;
+        }
+
+        if mode == "filenames" || mode == "both" {
+            // Filename search
+            if path_lower.contains(&query_lower) {
+                // Check if we already added this file (can happen with mode="both")
+                if !results.iter().any(|r| r.rel_path == rel_path) {
+                    results.push(SearchMatch {
+                        rel_path: rel_path.clone(),
+                        line_number: None,
+                        line_preview: None,
+                    });
+                }
+            }
+        }
+
+        if mode == "contents" || mode == "both" {
+            // Content search - read as text
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let mut line_num: u32 = 1;
+                for line in content.lines() {
+                    if line.to_lowercase().contains(&query_lower) {
+                        // Truncate long lines to 200 chars
+                        let preview: String = if line.len() > 200 {
+                            format!("{}...", &line[..197])
+                        } else {
+                            line.to_string()
+                        };
+                        // Only add content match if not already added
+                        if !results.iter().any(|r| r.rel_path == rel_path && r.line_number == Some(line_num)) {
+                            results.push(SearchMatch {
+                                rel_path: rel_path.clone(),
+                                line_number: Some(line_num),
+                                line_preview: Some(preview),
+                            });
+                        }
+                    }
+                    line_num = line_num.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+// ---------------------------------------------------------------------------
+// Backup file retrieval (for diff view)
+// ---------------------------------------------------------------------------
+
+/// Extracts and returns a file's content from a backup archive.
+/// Used for comparing current files with backup versions.
+#[tauri::command]
+pub fn get_file_from_backup(
+    app_handle: AppHandle,
+    id: String,
+    backup_name: String,
+    rel_path: String,
+) -> Result<Option<String>, String> {
+    let cfg = config::load_config(&app_handle)?;
+    let instance = cfg
+        .servers
+        .get(&id)
+        .ok_or_else(|| format!("server '{}' not found", id))?;
+
+    let backup_path = PathBuf::from(&instance.path)
+        .join("backups")
+        .join(&backup_name);
+
+    if !backup_path.exists() {
+        return Err(format!("backup '{}' not found", backup_name));
+    }
+
+    let file = std::fs::File::open(&backup_path)
+        .map_err(|e| format!("failed to open backup: {}", e))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| format!("invalid backup archive: {}", e))?;
+
+    // Find the entry matching rel_path
+    let entry_name = rel_path.replace('\', "/");
+    let mut found = None;
+    for i in 0..archive.len() {
+        if let Ok(f) = archive.by_index(i) {
+            let name = f.name().replace('\', "/");
+            if name == entry_name {
+                found = Some(i);
+                break;
+            }
+        }
+    }
+
+    let index = match found {
+        Some(i) => i,
+        None => return Ok(None), // File not in backup
+    };
+
+    let mut file = archive.by_index(index)
+        .map_err(|e| format!("failed to read archive entry: {}", e))?;
+    let mut content = String::new();
+    std::io::Read::read_to_string(&mut file, &mut content)
+        .map_err(|e| format!("failed to read file from backup: {}", e))?;
+
+    Ok(Some(content))
+}
+
+// ---------------------------------------------------------------------------
+// Binary file reading (for image preview)
+// ---------------------------------------------------------------------------
+
+/// Reads a file as base64-encoded bytes. Used for previewable binary types
+/// (images, etc.) where the frontend can decode and display them.
+#[tauri::command]
+pub fn read_file_bytes(app_handle: AppHandle, id: String, rel_path: String) -> Result<String, String> {
+    let cfg = config::load_config(&app_handle)?;
+    let instance = cfg
+        .servers
+        .get(&id)
+        .ok_or_else(|| format!("server '{}' not found", id))?

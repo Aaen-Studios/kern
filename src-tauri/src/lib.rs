@@ -11,6 +11,7 @@ mod scaffold;
 mod seed;
 mod tray;
 mod ui_state;
+mod watcher;
 mod window_state;
 
 use tauri::{Emitter, Listener, Manager, WindowEvent};
@@ -55,6 +56,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(process::ProcessRegistry::default())
         .manage(metrics::MetricsState::default())
+        .manage(watcher::WatcherState::default())
         .setup(|app| {
             let handle = app.handle().clone();
 
@@ -203,6 +205,8 @@ pub fn run() {
             commands::delete_server_path_recursive,
             commands::open_server_path,
             commands::copy_files_to_server,
+            watcher::watch_server_directory,
+            watcher::unwatch_server_directory,
             commands::list_plugins,
             commands::get_plugin,
             commands::get_plugin_ui_path,

@@ -14,6 +14,7 @@
 
 import { useState, useCallback, useEffect, useRef } from "react";
 import type { FileEntry } from "../../types/editor";
+import { InlineInput } from "../ui/InlineInput";
 
 interface FileTreeProps {
   /** Server instance id — used for backend calls in the parent. */
@@ -447,6 +448,7 @@ export function FileTree({
           expandedPaths={expandedPaths}
           onToggleExpand={onToggleExpand}
           onContextMenu={handleContextMenu}
+          refreshKey={refreshKey}
           // Inline rename
           renameState={renameState}
           onStartRename={startRename}
@@ -570,75 +572,6 @@ function ContextMenuButton({
   );
 }
 
-/* ── Inline input for rename / create ──────────────────────────────────── */
-
-function InlineInput({
-  value,
-  placeholder,
-  selectExtension,
-  onSubmit,
-  onCancel,
-}: {
-  value?: string;
-  placeholder?: string;
-  selectExtension?: boolean;
-  onSubmit: (value: string) => void;
-  onCancel: () => void;
-}) {
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    const el = inputRef.current;
-    if (!el) return;
-    el.focus();
-    if (value !== undefined && selectExtension) {
-      // Select the name part before the first dot (preserve extension).
-      const dotIdx = value.indexOf(".");
-      if (dotIdx > 0) {
-        el.setSelectionRange(0, dotIdx);
-      } else {
-        el.select();
-      }
-    } else {
-      el.select();
-    }
-  }, [value, selectExtension]);
-
-  const handleKey = useCallback(
-    (e: React.KeyboardEvent) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        onSubmit(inputRef.current?.value ?? "");
-      } else if (e.key === "Escape") {
-        e.preventDefault();
-        onCancel();
-      }
-    },
-    [onSubmit, onCancel],
-  );
-
-  return (
-    <input
-      ref={inputRef}
-      defaultValue={value ?? ""}
-      placeholder={placeholder}
-      onKeyDown={handleKey}
-      onBlur={(e) => {
-        // On blur, submit if non-empty, cancel otherwise.
-        const v = e.target.value.trim();
-        if (v) {
-          onSubmit(v);
-        } else {
-          onCancel();
-        }
-      }}
-      className="flex-1 bg-bg-core border border-signal-high/60 text-[11px] text-zinc-200 px-1.5 py-0.5 outline-none min-w-0"
-      spellCheck={false}
-      autoComplete="off"
-    />
-  );
-}
-
 /* ─── Recursive Tree Item ─────────────────────────────────────────────── */
 
 interface FileTreeItemProps {
@@ -651,6 +584,8 @@ interface FileTreeItemProps {
   expandedPaths: Set<string>;
   onToggleExpand: (relPath: string) => void;
   onContextMenu: (e: React.MouseEvent, relPath: string, isDir: boolean) => void;
+  /** Bumped by the parent to force a re-fetch of this directory's children. */
+  refreshKey: number;
 
   // Inline rename
   renameState: { relPath: string; initialName: string } | null;
@@ -704,6 +639,7 @@ function FileTreeItem({
   isDragging,
   setIsDragging,
   onDragEnd,
+  refreshKey,
 }: FileTreeItemProps) {
   const [children, setChildren] = useState<TreeNode[] | null>(null);
   const [loadingChildren, setLoadingChildren] = useState(false);
@@ -717,9 +653,21 @@ function FileTreeItem({
   const isDragOverFile = isDragOver && !entry.isDir;
   const isBeingDragged = isDragging && draggedRelPathRef.current === relPath;
 
-  // Load children when expanded for the first time.
+  // Load children when expanded for the first time, and re-load them whenever
+  // the parent bumps `refreshKey` (e.g. after a create/delete/rename, on
+  // window focus, or from a filesystem watcher event). Without this, the first
+  // lazy load would be cached forever and expanded directories would show
+  // stale contents after external changes.
+  //
+  // `children` is deliberately omitted from the deps: it is set *inside* the
+  // effect, so including it would retrigger the effect after every fetch and
+  // spin into an infinite loop. We instead track the last-applied refreshKey
+  // in a ref and only refetch when it advances or the directory newly expands.
+  const lastRefreshKey = useRef<number>(-1);
   useEffect(() => {
-    if (!entry.isDir || !isExpanded || children !== null) return;
+    if (!entry.isDir || !isExpanded) return;
+    if (lastRefreshKey.current === refreshKey && children !== null) return;
+    lastRefreshKey.current = refreshKey;
     let cancelled = false;
     setLoadingChildren(true);
     onListDirectory(relPath)
@@ -744,7 +692,7 @@ function FileTreeItem({
     return () => {
       cancelled = true;
     };
-  }, [entry.isDir, isExpanded, children, onListDirectory, relPath]);
+  }, [entry.isDir, isExpanded, onListDirectory, relPath, refreshKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleClick = useCallback(() => {
     if (entry.isDir) {
@@ -914,6 +862,7 @@ function FileTreeItem({
                 expandedPaths={expandedPaths}
                 onToggleExpand={onToggleExpand}
                 onContextMenu={onContextMenu}
+                refreshKey={refreshKey}
                 renameState={renameState}
                 onStartRename={onStartRename}
                 onSubmitRename={onSubmitRename}
