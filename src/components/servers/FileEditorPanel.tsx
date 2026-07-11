@@ -15,15 +15,12 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { listen } from "@tauri-apps/api/event";
 import { FileTree } from "./FileTree";
 import { EditorTabBar } from "./EditorTabBar";
 import { CodeEditor, configureMonaco } from "./CodeEditor";
 import { useFileEditor } from "../../hooks/useFileEditor";
 import { useUiState } from "../../hooks/useUiState";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
-import { InlineInput } from "../ui/InlineInput";
 
 interface FileEditorPanelProps {
   /** Server instance id — scopes all file operations. */
@@ -84,9 +81,6 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
     isDir: boolean;
   } | null>(null);
 
-  // Inline create state for header buttons (replaces prompt() fallback).
-  const [createState, setCreateState] = useState<"file" | "folder" | null>(null);
-
   // Track whether we've already restored the open-file session for this server.
   const restoredRef = useRef(false);
 
@@ -143,58 +137,6 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
       unlisten?.();
     };
   }, [serverId, handleDragOverChange]);
-
-  // ── Auto-refresh: window focus + filesystem watcher ─────────────────────
-  // Two complementary signals bump `refreshTree` so the explorer stays current
-  // with both external edits and writes from the running server process.
-  //
-  // 1) Focus refresh (VS Code-style): when the kern window regains focus we
-  //    reload, picking up any changes made while we were in the background.
-  // 2) FS watcher: the backend watches this instance's directory recursively
-  //    and emits `server://fs-changed` (debounced) on any mutation. This
-  //    catches live writes from the server process without needing focus.
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-    (async () => {
-      try {
-        unlisten = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
-          if (!cancelled && focused) setRefreshTree((k) => k + 1);
-        });
-      } catch (e) {
-        console.warn("Failed to register window focus listener:", e);
-      }
-    })();
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, []);
-
-  // Register the backend watcher for this instance on mount, listen for change
-  // events, and unwatch on unmount. The watcher is per-instance, so any event
-  // arriving while this panel is mounted belongs to this server.
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-    (async () => {
-      try {
-        await invoke("watch_server_directory", { id: serverId });
-        unlisten = await listen<{ path: string }>("server://fs-changed", () => {
-          if (!cancelled) setRefreshTree((k) => k + 1);
-        });
-      } catch (e) {
-        console.warn("Failed to start file watcher:", e);
-      }
-    })();
-    return () => {
-      cancelled = true;
-      unlisten?.();
-      invoke("unwatch_server_directory", { id: serverId }).catch(() => {
-        // Non-fatal — directory may already be gone.
-      });
-    };
-  }, [serverId]);
 
   // Restore open files on mount: reload each persisted path from disk.
   useEffect(() => {
@@ -372,34 +314,6 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
     [createDirectory],
   );
 
-  // ── Inline create (header) ────────────────────────────────────────────────
-
-  const startCreate = useCallback((type: "file" | "folder") => {
-    setCreateState(type);
-  }, []);
-
-  const submitCreate = useCallback(
-    async (name: string) => {
-      if (!createState) return;
-      const trimmed = name.trim();
-      if (!trimmed) {
-        setCreateState(null);
-        return;
-      }
-      if (createState === "file") {
-        await handleCreateFile("", trimmed);
-      } else {
-        await handleCreateFolder("", trimmed);
-      }
-      setCreateState(null);
-    },
-    [createState, handleCreateFile, handleCreateFolder],
-  );
-
-  const cancelCreate = useCallback(() => {
-    setCreateState(null);
-  }, []);
-
   // ── Rename ───────────────────────────────────────────────────────────────
 
   const handleRename = useCallback(
@@ -487,45 +401,39 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
           </span>
           <div className="flex items-center gap-1">
             <button
-              onClick={() => startCreate("file")}
+              onClick={() => {
+                // Trigger a new-file creation at root via the tree key.
+                // We signal this via a key-change trick: the tree re-renders and
+                // picks up the create state. Simpler: direct call to handleCreateFile
+                // with an empty inline prompt would be better. For now, we use
+                // a prompt-based approach.
+                const name = prompt("Enter file name:");
+                if (name && name.trim()) {
+                  handleCreateFile("", name.trim());
+                }
+              }}
               className="text-[10px] text-zinc-500 hover:text-zinc-200 transition-colors px-1"
               title="New File…"
             >
               + file
             </button>
             <button
-              onClick={() => startCreate("folder")}
+              onClick={() => {
+                const name = prompt("Enter folder name:");
+                if (name && name.trim()) {
+                  handleCreateFolder("", name.trim());
+                }
+              }}
               className="text-[10px] text-zinc-500 hover:text-zinc-200 transition-colors px-1"
               title="New Folder…"
             >
               + folder
-            </button>
-            <button
-              onClick={() => setRefreshTree((k) => k + 1)}
-              className="text-[10px] text-zinc-500 hover:text-zinc-200 transition-colors px-1"
-              title="Refresh"
-            >
-              ↻
             </button>
             <span className="text-[10px] text-zinc-600 tabular-nums ml-1">
               {tabs.length}
             </span>
           </div>
         </div>
-
-        {/* Inline create input at root level (header-triggered) */}
-        {createState && (
-          <div className="flex items-center gap-1.5 px-3 py-1.5 border-t border-grid-bounds">
-            <span className="w-3.5 text-[10px] text-signal-low shrink-0 text-center">
-              {createState === "folder" ? "▸" : ""}
-            </span>
-            <InlineInput
-              placeholder={createState === "file" ? "filename.ext…" : "folder name…"}
-              onSubmit={(name) => submitCreate(name)}
-              onCancel={cancelCreate}
-            />
-          </div>
-        )}
         <FileTree
           serverId={serverId}
           activeFile={activeFile}
