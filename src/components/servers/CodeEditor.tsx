@@ -15,6 +15,17 @@ import type { editor } from "monaco-editor";
 import { KERN_THEME } from "./editorTheme";
 import { registerCustomLanguages } from "./monarchLanguages";
 
+/**
+ * Tracks whether the Monaco editor currently has keyboard focus.
+ *
+ * Shared module-level singleton — the CodeEditor updates it via Monaco's own
+ * onDidFocusEditorText / onDidBlurEditorText events (more reliable than DOM
+ * activeElement checks inside Tauri's webview), and the FileEditorPanel reads
+ * it in its window-level keydown handler so it can leave Ctrl+F and Escape
+ * alone when the user is actually editing.
+ */
+export const editorFocus = { focused: false };
+
 // Configure Monaco to bundle inline (avoids web worker CORS issues in Tauri).
 // The `loader.config({ monaco })` call tells the React wrapper to use
 // the local bundle instead of fetching from CDN.
@@ -170,6 +181,16 @@ export function CodeEditor({
           onCursorPosition(line, column);
         });
       }
+
+      // Track editor focus so the FileEditorPanel keyboard handler knows when
+      // to defer Ctrl+F / Escape to Monaco. Monaco's own events are far more
+      // reliable than inspecting document.activeElement in Tauri's webview.
+      ed.onDidFocusEditorText(() => {
+        editorFocus.focused = true;
+      });
+      ed.onDidBlurEditorText(() => {
+        editorFocus.focused = false;
+      });
 
       // Focus the editor on mount so the user can start typing immediately.
       if (!readOnly) {

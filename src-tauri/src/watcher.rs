@@ -15,7 +15,10 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use notify_debouncer_mini::{new_debouncer, DebouncedEvent, notify::RecommendedWatcher};
+use notify_debouncer_mini::{
+    notify::{RecursiveMode, RecommendedWatcher},
+    DebouncedEvent, new_debouncer,
+};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 use tauri::command;
@@ -64,11 +67,15 @@ pub fn watch_server_directory(
         .ok_or_else(|| format!("server '{id}' not found"))?;
     let root = PathBuf::from(&instance.path);
 
-    // Ensure the directory exists — notify can't watch a missing path. This
-    // mirrors create_server, but the directory may have been removed since.
-    if !root.exists() {
-        std::fs::create_dir_all(&root)
-            .map_err(|e| format!("failed to create instance directory '{}': {e}", root.display()))?;
+    // Don't silently create a missing directory here — that would mask an
+    // intentionally-deleted instance folder and resurrect it just because the
+    // user opened the files tab. If the path is gone, surface the error so the
+    // frontend can log it and the orphaned state stays honest.
+    if !root.is_dir() {
+        return Err(format!(
+            "instance directory '{}' does not exist",
+            root.display()
+        ));
     }
 
     let handle = app_handle.clone();
@@ -108,7 +115,7 @@ pub fn watch_server_directory(
         .ok_or_else(|| "watcher not initialised".to_string())?;
     debouncer
         .watcher()
-        .watch(&root, notify::RecursiveMode::Recursive)
+        .watch(&root, RecursiveMode::Recursive)
         .map_err(|e| format!("failed to watch '{}': {e}", root.display()))?;
     watched.insert(root);
 
@@ -127,15 +134,18 @@ pub fn unwatch_server_directory(
     let instance = cfg
         .servers
         .get(&id)
-        .ok_or_else(|| format!("server '{id} not found"))?;
+        .ok_or_else(|| format!("server '{id}' not found"))?;
     let root = PathBuf::from(&instance.path);
 
+    // Acquire locks in the SAME order as watch_server_directory
+    // (debouncer → watched) to avoid an AB-BA deadlock if a watch and unwatch
+    // ever run concurrently (e.g. two panels mounting/unmounting at once).
+    let mut debouncer_guard = state.debouncer.lock().map_err(|e| format!("watcher lock poisoned: {e}"))?;
     let mut watched = state.watched.lock().map_err(|e| format!("watcher lock poisoned: {e}"))?;
     if !watched.remove(&root) {
         return Ok(()); // wasn't being watched — nothing to do
     }
 
-    let mut debouncer_guard = state.debouncer.lock().map_err(|e| format!("watcher lock poisoned: {e}"))?;
     if let Some(debouncer) = debouncer_guard.as_mut() {
         let _ = debouncer.watcher().unwatch(&root);
     }

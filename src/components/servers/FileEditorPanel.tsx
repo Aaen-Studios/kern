@@ -15,10 +15,13 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 import { FileTree } from "./FileTree";
 import { EditorTabBar } from "./EditorTabBar";
-import { CodeEditor, configureMonaco } from "./CodeEditor";
+import { CodeEditor, configureMonaco, editorFocus } from "./CodeEditor";
 import { useFileEditor } from "../../hooks/useFileEditor";
+import { FileSearchPanel } from "./FileSearchPanel";
 import { useUiState } from "../../hooks/useUiState";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
 
@@ -89,6 +92,7 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
   // dragover/dragleave). State is for React re-renders (visual feedback).
   const dragOverRelPathRef = useRef<string | null>(null);
   const [dragOverRelPath, setDragOverRelPath] = useState<string | null>(null);
+  const [showSearch, setShowSearch] = useState(false);
 
   const handleDragOverChange = useCallback((path: string | null) => {
     dragOverRelPathRef.current = path;
@@ -137,6 +141,83 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
       unlisten?.();
     };
   }, [serverId, handleDragOverChange]);
+
+  // ── Auto-refresh: window focus + filesystem watcher ─────────────────────
+  // Two complementary signals bump `refreshTree` so the explorer stays current
+  // with both external edits and writes from the running server process.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        unlisten = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+          if (!cancelled && focused) setRefreshTree((k) => k + 1);
+        });
+      } catch (e) {
+        console.warn("Failed to register window focus listener:", e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  // Register the backend watcher for this instance on mount, listen for change
+  // events, and unwatch on unmount.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        await invoke("watch_server_directory", { id: serverId });
+        unlisten = await listen<{ path: string }>("server://fs-changed", () => {
+          if (!cancelled) setRefreshTree((k) => k + 1);
+        });
+      } catch (e) {
+        console.warn("Failed to start file watcher:", e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+      invoke("unwatch_server_directory", { id: serverId }).catch(() => {
+        // Non-fatal — directory may already be gone.
+      });
+    };
+  }, [serverId]);
+
+  // ── Keyboard shortcuts: Ctrl/Cmd+F to toggle search, Esc to close ───────
+  // Both are captured on the *capture* phase but ONLY fire when the Monaco
+  // editor doesn't have focus — so the editor keeps its own Ctrl+F (find) and
+  // Esc (close find widget / exit snippet) behaviour. Editor focus is tracked
+  // by CodeEditor via Monaco's own onDidFocusEditorText/Blur events and
+  // exposed through the shared `editorFocus` singleton — more reliable than
+  // inspecting document.activeElement inside Tauri's webview.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      // Ctrl/Cmd+F → toggle search (unless the editor is focused).
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+        if (editorFocus.focused) return;
+        e.preventDefault();
+        e.stopPropagation();
+        setShowSearch((s) => !s);
+        return;
+      }
+      // Escape → close search (unless the editor is focused).
+      if (e.key === "Escape") {
+        if (editorFocus.focused) return;
+        setShowSearch((s) => {
+          if (!s) return s;
+          e.preventDefault();
+          e.stopPropagation();
+          return false;
+        });
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, []);
 
   // Restore open files on mount: reload each persisted path from disk.
   useEffect(() => {
@@ -393,41 +474,25 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
   return (
     <div className="flex flex-1 min-h-0">
       {/* File tree sidebar */}
-      <div className="w-[220px] shrink-0 flex flex-col border-r border-grid-bounds matrix-border">
-        {/* Explorer header */}
+      <div className="relative w-[220px] shrink-0 flex flex-col border-r border-grid-bounds matrix-border">
+        {/* Explorer header.
+            The "explorer" label is clickable: it toggles the search popup on
+            and off (clicking it again closes the overlay). */}
         <div className="flex items-center justify-between px-3 py-1.5 border-b border-grid-bounds">
-          <span className="text-[10px] tracking-[0.2em] uppercase text-zinc-500">
+          <button
+            onClick={() => setShowSearch((s) => !s)}
+            className={`text-[10px] tracking-[0.2em] uppercase text-zinc-500 hover:text-zinc-300 transition-colors ${showSearch ? "text-signal-high" : ""}`}
+            title={showSearch ? "Close search (Esc)" : "Search (Ctrl+F)"}
+          >
             explorer
-          </span>
+          </button>
           <div className="flex items-center gap-1">
             <button
-              onClick={() => {
-                // Trigger a new-file creation at root via the tree key.
-                // We signal this via a key-change trick: the tree re-renders and
-                // picks up the create state. Simpler: direct call to handleCreateFile
-                // with an empty inline prompt would be better. For now, we use
-                // a prompt-based approach.
-                const name = prompt("Enter file name:");
-                if (name && name.trim()) {
-                  handleCreateFile("", name.trim());
-                }
-              }}
+              onClick={() => setRefreshTree((k) => k + 1)}
               className="text-[10px] text-zinc-500 hover:text-zinc-200 transition-colors px-1"
-              title="New File…"
+              title="Refresh"
             >
-              + file
-            </button>
-            <button
-              onClick={() => {
-                const name = prompt("Enter folder name:");
-                if (name && name.trim()) {
-                  handleCreateFolder("", name.trim());
-                }
-              }}
-              className="text-[10px] text-zinc-500 hover:text-zinc-200 transition-colors px-1"
-              title="New Folder…"
-            >
-              + folder
+              refresh
             </button>
             <span className="text-[10px] text-zinc-600 tabular-nums ml-1">
               {tabs.length}
@@ -457,6 +522,15 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
           dragOverRelPath={dragOverRelPath}
           onDragOverChange={handleDragOverChange}
         />
+        {showSearch && (
+          <div className="absolute top-[29px] left-0 right-0 bottom-0 z-30 bg-bg-core border-b border-grid-bounds shadow-xl flex flex-col">
+            <FileSearchPanel
+              serverId={serverId}
+              onOpenFile={handleOpenFile}
+              onClose={() => setShowSearch(false)}
+            />
+          </div>
+        )}
       </div>
 
       {/* Editor area */}

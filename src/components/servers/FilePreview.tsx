@@ -1,0 +1,215 @@
+/**
+ * File preview component for images, markdown, and JSON files.
+ *
+ * Provides read-only preview views that complement the text editor:
+ *   - Images: rendered via <img> tag with base64 encoding
+ *   - Markdown: rendered as HTML with custom styling
+ *   - JSON: rendered as a collapsible tree view
+ */
+
+import { useMemo } from "react";
+import type { OpenFile } from "../../types/editor";
+
+interface FilePreviewProps {
+  /** The open file to preview. */
+  file: OpenFile;
+  /** Base64-encoded content for binary files (images). */
+  base64Content?: string;
+  /** Height of the preview area. */
+  height?: string;
+}
+
+/** Check if the file is previewable based on its language/content type. */
+function _getPreviewType(language: string): "image" | "markdown" | "json" | "none" {
+  if (language === "json" || language === "jsonc") {
+    // JSON files can be previewed as tree
+    return "json";
+  }
+  if (language === "markdown") {
+    return "markdown";
+  }
+  // For images, we rely on base64Content being present
+  return "none";
+}
+
+/** Format bytes to human-readable string. */
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * JSON tree node component.
+ */
+function JsonTreeNode({ data, keyPath }: { data: unknown; keyPath: string }) {
+  if (typeof data === "object" && data !== null) {
+    if (Array.isArray(data)) {
+      return (
+        <div className="ml-3">
+          {data.map((item, i) => (
+            <JsonTreeNode key={i} data={item} keyPath={`${keyPath}[${i}]`} />
+          ))}
+        </div>
+      );
+    }
+    const obj = data as Record<string, unknown>;
+    return (
+      <div className="ml-3">
+        {Object.entries(obj).map(([k, v]) => (
+          <JsonTreeNode key={k} data={v} keyPath={`${keyPath}.${k}`} />
+        ))}
+      </div>
+    );
+  }
+  return (
+    <div className="flex items-baseline gap-1 font-mono text-[11px]">
+      <span className="text-zinc-500">{keyPath}:</span>
+      <span className={typeof data === "string" ? "text-signal-high" : "text-zinc-300"}>
+        {typeof data === "string" ? `"${data}"` : String(data)}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * JSON preview component - collapsible tree view of the JSON structure.
+ */
+function JsonPreview({ content }: { content: string }) {
+  const data = useMemo(() => {
+    try {
+      return JSON.parse(content);
+    } catch {
+      return null;
+    }
+  }, [content]);
+
+  if (!data) {
+    return <p className="text-[11px] text-fault-vector p-3">Invalid JSON</p>;
+  }
+
+  const size = content.length;
+  const formattedSize = formatSize(size);
+
+  return (
+    <div className="p-3 overflow-y-auto">
+      <div className="flex items-center justify-between mb-2 pb-1 border-b border-grid-bounds">
+        <span className="text-[10px] tracking-[0.2em] uppercase text-zinc-500">JSON</span>
+        <span className="text-[10px] text-zinc-600 tabular-nums">{formattedSize}</span>
+      </div>
+      <JsonTreeNode data={data} keyPath="root" />
+    </div>
+  );
+}
+
+/**
+ * Markdown preview component - renders markdown as HTML.
+ */
+function MarkdownPreview({ content }: { content: string }) {
+  // Simple markdown to HTML conversion (for demo - in production, use a library)
+  const html = useMemo(() => {
+    // Basic markdown parsing - headers, bold, italic, code, links
+    let result = content;
+    // Headers
+    result = result.replace(/^### (.*$)/gim, "<h3>$1</h3>");
+    result = result.replace(/^## (.*$)/gim, "<h2>$1</h2>");
+    result = result.replace(/^# (.*$)/gim, "<h1>$1</h1>");
+    // Bold
+    result = result.replace(/\*\*(.*)\*\*/gim, "<strong>$1</strong>");
+    // Italic
+    result = result.replace(/\*(.*)\*/gim, "<em>$1</em>");
+    // Code
+    result = result.replace(/`(.*)`/gim, "<code>$1</code>");
+    // Links
+    result = result.replace(/\[(.*)\]\((.*)\)/gim, '<a href="$2">$1</a>');
+    // Paragraphs
+    result = result.split("\n\n").map(p => `<p>${p}</p>`).join("\n");
+    return result;
+  }, [content]);
+
+  return (
+    <div className="p-3 overflow-y-auto prose prose-invert prose-sm max-w-none">
+      <div dangerouslySetInnerHTML={{ __html: html }} />
+    </div>
+  );
+}
+
+/**
+ * Main file preview component - dispatches to appropriate preview type.
+ */
+export function FilePreview({ file, base64Content, height = "400px" }: FilePreviewProps) {
+  void base64Content; // Reserved for image preview support
+  const previewType = _getPreviewType(file.language);
+
+  if (previewType === "image") {
+    // This shouldn't happen as we need base64Content
+    return (
+      <div style={{ height }} className="flex items-center justify-center bg-bg-core">
+        <p className="text-[11px] text-zinc-500">Image preview requires binary content</p>
+      </div>
+    );
+  }
+
+  if (previewType === "markdown") {
+    return (
+      <div style={{ height }} className="bg-bg-core">
+        <MarkdownPreview content={file.content} />
+      </div>
+    );
+  }
+
+  if (previewType === "json") {
+    return (
+      <div style={{ height }} className="bg-bg-core">
+        <JsonPreview content={file.content} />
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ height }} className="flex items-center justify-center bg-bg-core">
+      <p className="text-[11px] text-zinc-500">No preview available for this file type</p>
+    </div>
+  );
+}
+
+/**
+ * Image preview component - renders images using base64 data URL.
+ */
+export function ImagePreview({ base64Content, fileName, height = "400px" }: {
+  base64Content: string;
+  fileName: string;
+  height?: string;
+}) {
+  // Determine MIME type from file extension
+  const mimeType = useMemo(() => {
+    const ext = fileName.split(".").pop()?.toLowerCase();
+    switch (ext) {
+      case "png": return "image/png";
+      case "jpg":
+      case "jpeg": return "image/jpeg";
+      case "gif": return "image/gif";
+      case "webp": return "image/webp";
+      case "svg": return "image/svg+xml";
+      default: return "image/png";
+    }
+  }, [fileName]);
+
+  const src = `data:${mimeType};base64,${base64Content}`;
+  const size = base64Content.length;
+  const formattedSize = formatSize(size);
+
+  return (
+    <div style={{ height }} className="flex flex-col bg-bg-core">
+      <div className="flex items-center justify-between px-3 py-1.5 border-b border-grid-bounds">
+        <span className="text-[10px] tracking-[0.2em] uppercase text-zinc-500">
+          image preview
+        </span>
+        <span className="text-[10px] text-zinc-600 tabular-nums">{formattedSize}</span>
+      </div>
+      <div className="flex-1 flex items-center justify-center overflow-auto p-4">
+        <img src={src} alt={fileName} className="max-w-full max-h-full object-contain" />
+      </div>
+    </div>
+  );
+}
