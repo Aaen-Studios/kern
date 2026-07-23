@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useSettings } from "../../hooks/useSettings";
+import type { AppSettings } from "../../types/server";
 
 interface SettingsViewProps {
   /** Called when the user wants to go back to the server list. */
@@ -31,11 +32,31 @@ export function SettingsView({ onBack }: SettingsViewProps) {
     }
   }
 
-  async function handleSetting(key: "closeToTray" | "startHiddenInTray", value: boolean) {
+  async function handleSetting(key: "closeToTray" | "startHiddenInTray" | "webRemoteEnabled", value: boolean) {
     if (!settings) return;
     setActionError(null);
     try {
       await update({ [key]: value } as Partial<typeof settings>);
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }
+
+  async function handleStringSetting(key: keyof AppSettings, value: string) {
+    if (!settings) return;
+    setActionError(null);
+    try {
+      await update({ [key]: value } as Partial<AppSettings>);
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }
+
+  async function handleNumberSetting(key: keyof AppSettings, value: number) {
+    if (!settings) return;
+    setActionError(null);
+    try {
+      await update({ [key]: value } as Partial<AppSettings>);
     } catch (e) {
       setActionError(String(e));
     }
@@ -117,6 +138,87 @@ export function SettingsView({ onBack }: SettingsViewProps) {
                 to one. Left-click toggles the window.
               </p>
             </section>
+
+            {/* ── Power / cost section ────────────────────────────────── */}
+            <section>
+              <h3 className="text-[10px] tracking-[0.2em] uppercase text-zinc-500 mb-3">
+                power &amp; cost
+              </h3>
+              <div className="space-y-1 border border-grid-bounds">
+                <InputRow
+                  label="Electricity price per kWh"
+                  description="Your local price, in any currency. Drives the per-instance cost estimate on the detail view. Set to 0 to hide the meter."
+                  value={String(settings.powerPricePerKwh ?? 0)}
+                  onCommit={(v) => void handleNumberSetting("powerPricePerKwh", parseFloat(v) || 0)}
+                  type="number"
+                />
+                <Divider />
+                <InputRow
+                  label="Machine power draw (watts)"
+                  description="Average wattage of this machine under load. Tune to your hardware for an accurate cost figure."
+                  value={String(settings.machineWatts ?? 120)}
+                  onCommit={(v) => void handleNumberSetting("machineWatts", parseFloat(v) || 120)}
+                  type="number"
+                />
+              </div>
+            </section>
+
+            {/* ── Registry / marketplace section ──────────────────────── */}
+            <section>
+              <h3 className="text-[10px] tracking-[0.2em] uppercase text-zinc-500 mb-3">
+                plugin registry
+              </h3>
+              <div className="space-y-1 border border-grid-bounds">
+                <InputRow
+                  label="Registry URL"
+                  description="Base URL of the plugin marketplace. Defaults to the live kern site."
+                  value={settings.registryUrl ?? "https://kern.aaenz.no"}
+                  onCommit={(v) => void handleStringSetting("registryUrl", v)}
+                />
+              </div>
+            </section>
+
+            {/* ── Web remote section ──────────────────────────────────── */}
+            <section>
+              <h3 className="text-[10px] tracking-[0.2em] uppercase text-zinc-500 mb-3">
+                web remote
+              </h3>
+              <div className="space-y-1 border border-grid-bounds">
+                <ToggleRow
+                  label="Enable web remote"
+                  description="Serve a read-mostly JSON API on port 7440 so a phone (or anything on your LAN) can view status and start/stop servers. Requires a restart to take effect."
+                  checked={!!settings.webRemoteEnabled}
+                  onChange={(v) => void handleSetting("webRemoteEnabled", v)}
+                />
+                <Divider />
+                <InputRow
+                  label="Passphrase"
+                  description="Required to access the remote (send as: Authorization: Bearer <passphrase>). Leave empty for open access on your LAN."
+                  value={settings.webRemotePassphrase ?? ""}
+                  onCommit={(v) => void handleStringSetting("webRemotePassphrase", v)}
+                  mono
+                />
+              </div>
+              <p className="mt-2 text-[11px] text-zinc-600">
+                When enabled, reach the API at <span className="font-mono text-zinc-400">http://&lt;this-machine&gt;:7440/servers</span>.
+              </p>
+            </section>
+
+            {/* ── Sync section ────────────────────────────────────────── */}
+            <section>
+              <h3 className="text-[10px] tracking-[0.2em] uppercase text-zinc-500 mb-3">
+                multi-machine sync
+              </h3>
+              <div className="space-y-1 border border-grid-bounds">
+                <InputRow
+                  label="Git repo URL"
+                  description="Optional. Set to share your registry across machines (export/import — instances stay local, only metadata travels). Requires git on your PATH."
+                  value={settings.syncRepoUrl ?? ""}
+                  onCommit={(v) => void handleStringSetting("syncRepoUrl", v)}
+                  mono
+                />
+              </div>
+            </section>
           </div>
         </div>
       )}
@@ -162,6 +264,61 @@ function ToggleRow({
 
 function Divider() {
   return <div className="h-px bg-grid-bounds mx-3" />;
+}
+
+/* ─── Text / number input row ──────────────────────────────────────────── */
+
+interface InputRowProps {
+  label: string;
+  description?: string;
+  value: string;
+  /** Fired when the field loses focus (Enter / blur) with the latest value. */
+  onCommit: (value: string) => void;
+  type?: "text" | "number";
+  mono?: boolean;
+}
+
+/**
+ * Editable settings row. Commits on blur rather than on every keystroke so we
+ * don't spam config writes. Renders as a labeled input inside the card style.
+ */
+function InputRow({ label, description, value, onCommit, type = "text", mono }: InputRowProps) {
+  const [draft, setDraft] = useState(value);
+
+  // Keep the local draft in sync if the upstream value changes elsewhere —
+  // but only when this field isn't focused (so we don't clobber an in-progress edit).
+  useEffect(() => {
+    const el = document.activeElement;
+    if (el?.getAttribute("data-label") !== label) {
+      setDraft(value);
+    }
+  }, [value, label]);
+
+  return (
+    <div className="flex flex-col gap-1 px-3 py-3 bg-bg-surface">
+      <label className="text-xs text-zinc-200">{label}</label>
+      {description && (
+        <div className="text-[11px] text-zinc-500 leading-snug">{description}</div>
+      )}
+      <input
+        data-label={label}
+        type={type}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => {
+          if (draft !== value) onCommit(draft);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            (e.target as HTMLInputElement).blur();
+          }
+        }}
+        className={`mt-1 w-full bg-bg-core border border-grid-bounds px-2 py-1.5 text-xs text-zinc-100 focus:border-signal-low outline-none ${
+          mono ? "font-mono" : ""
+        }`}
+      />
+    </div>
+  );
 }
 
 /* ─── Switch control ──────────────────────────────────────────────────── */

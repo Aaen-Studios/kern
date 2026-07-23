@@ -25,6 +25,8 @@ type StatusPayload =
 
 /** Map of instanceId → live status. */
 export type LiveStatusMap = Record<string, ServerStatus>;
+/** Set of instance ids that are re-adopted PID-only monitors (no graceful stop). */
+export type LiveAdoptedSet = Set<string>;
 
 /** Wildcard pattern prefix used for status events. */
 const STATUS_EVENT_PREFIX = "status:";
@@ -32,6 +34,8 @@ const STATUS_EVENT_PREFIX = "status:";
 interface UseLiveStatusResult {
   /** Live status per instance id, overlaid on persisted status. */
   liveStatus: LiveStatusMap;
+  /** Ids of re-adopted (PID-only) processes — surfaced as a distinct badge. */
+  liveAdopted: LiveAdoptedSet;
 }
 
 /**
@@ -41,6 +45,7 @@ interface UseLiveStatusResult {
  */
 export function useLiveStatus(ids: string[]): UseLiveStatusResult {
   const [liveStatus, setLiveStatus] = useState<LiveStatusMap>({});
+  const [liveAdopted, setLiveAdopted] = useState<LiveAdoptedSet>(new Set());
 
   useEffect(() => {
     if (ids.length === 0) return;
@@ -48,6 +53,17 @@ export function useLiveStatus(ids: string[]): UseLiveStatusResult {
     const unlistens: UnlistenFn[] = [];
 
     (async () => {
+      // Seed the adopted set once from the running-servers list, so re-adopted
+      // processes (from a previous session) are badged immediately on open.
+      try {
+        const running = await invoke<Array<{ id: string; adopted: boolean }>>(
+          "list_running_servers",
+        );
+        if (!disposed) {
+          setLiveAdopted(new Set(running.filter((r) => r.adopted).map((r) => r.id)));
+        }
+      } catch { /* non-fatal */ }
+
       for (const id of ids) {
         try {
           // Seed from the actual process registry: if a process is already
@@ -66,9 +82,16 @@ export function useLiveStatus(ids: string[]): UseLiveStatusResult {
               setLiveStatus((prev) => ({ ...prev, [id]: "running" }));
               void invoke("update_server_status", { id, status: "running" });
             } else {
-              // exited — map exit code to stopped/error and persist.
+              // exited — map exit code to stopped/error and persist. Also drop
+              // it from the adopted set (it's no longer running at all).
               const next: ServerStatus = payload.code != null && payload.code !== 0 ? "error" : "stopped";
               setLiveStatus((prev) => ({ ...prev, [id]: next }));
+              setLiveAdopted((prev) => {
+                if (!prev.has(id)) return prev;
+                const n = new Set(prev);
+                n.delete(id);
+                return n;
+              });
               void invoke("update_server_status", { id, status: next });
             }
           });
@@ -89,5 +112,5 @@ export function useLiveStatus(ids: string[]): UseLiveStatusResult {
     };
   }, [ids.join(",")]); // re-subscribe when the set of ids changes
 
-  return { liveStatus };
+  return { liveStatus, liveAdopted };
 }

@@ -20,10 +20,13 @@ import { listen } from "@tauri-apps/api/event";
 import { FileTree } from "./FileTree";
 import { EditorTabBar } from "./EditorTabBar";
 import { CodeEditor, configureMonaco, editorFocus } from "./CodeEditor";
+import { FilePreview, ImagePreview } from "./FilePreview";
+import { DiffViewer } from "./DiffViewer";
 import { useFileEditor } from "../../hooks/useFileEditor";
 import { FileSearchPanel } from "./FileSearchPanel";
 import { useUiState } from "../../hooks/useUiState";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
+import { useToast } from "../../hooks/useToast";
 
 interface FileEditorPanelProps {
   /** Server instance id — scopes all file operations. */
@@ -43,6 +46,7 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
     dirtyCount,
     tabs,
     activeFileData,
+    conflict,
     // Actions
     openFile,
     closeFile,
@@ -56,9 +60,22 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
     createFile,
     createDirectory,
     renamePath,
+    forceSave,
+    reloadFile,
+    dismissConflict,
   } = useFileEditor(serverId);
 
   const { uiState, updateServer } = useUiState();
+  const { notify } = useToast();
+
+  // Mirror editor errors (failed reads/writes/conflicts) to the global toast
+  // so they persist even if the user navigates away mid-edit. The inline
+  // dismissable banner stays for in-context feedback.
+  useEffect(() => {
+    if (error) {
+      notify({ kind: "error", title: "Editor", message: error });
+    }
+  }, [error, notify]);
 
   // ── Persisted per-server editor state ─────────────────────────────────
   const serverUi = uiState.servers[serverId] ?? {
@@ -93,6 +110,25 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
   const dragOverRelPathRef = useRef<string | null>(null);
   const [dragOverRelPath, setDragOverRelPath] = useState<string | null>(null);
   const [showSearch, setShowSearch] = useState(false);
+
+  // ── View mode: edit | preview | diff ──────────────────────────────────────
+  // The active file can be viewed three ways. Markdown/JSON/images default to
+  // preview; everything else defaults to edit. The user can toggle freely.
+  // Diff compares the working copy against a chosen backup (wired to the
+  // previously-unused get_file_from_backup command).
+  const [viewMode, setViewMode] = useState<"edit" | "preview" | "diff">("edit");
+  const [imageBytes, setImageBytes] = useState<string | null>(null);
+  const [diffOriginal, setDiffOriginal] = useState<string | null>(null);
+  const [viewLoading, setViewLoading] = useState(false);
+
+  /** File extensions that have a read-only preview renderer. */
+  const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg"]);
+  const isImageFile = (relPath: string): boolean => {
+    const ext = relPath.split(".").pop()?.toLowerCase() ?? "";
+    return IMAGE_EXTENSIONS.has(ext);
+  };
+  const isPreviewable = (language: string): boolean =>
+    language === "markdown" || language === "json" || language === "jsonc";
 
   const handleDragOverChange = useCallback((path: string | null) => {
     dragOverRelPathRef.current = path;
@@ -186,6 +222,58 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
       });
     };
   }, [serverId]);
+
+  // ── Auto-pick view mode for newly-opened files ────────────────────────────
+  // When the active file changes, reset to its natural view: image/markdown/
+  // JSON files open in preview, everything else in edit.
+  useEffect(() => {
+    if (!activeFileData) return;
+    setImageBytes(null);
+    setDiffOriginal(null);
+    if (isImageFile(activeFileData.relPath) || isPreviewable(activeFileData.language)) {
+      setViewMode("preview");
+    } else {
+      setViewMode("edit");
+    }
+  }, [activeFile, activeFileData?.relPath, activeFileData?.language]);
+
+  // ── Load preview/diff payload on demand ───────────────────────────────────
+  useEffect(() => {
+    if (!activeFileData) return;
+    let cancelled = false;
+
+    if (viewMode === "preview" && isImageFile(activeFileData.relPath)) {
+      // Image preview needs the raw bytes (base64) — the editor's text content
+      // is meaningless for binary. Fetched once per file/mode switch.
+      setViewLoading(true);
+      invoke<string>("read_file_bytes", { id: serverId, relPath: activeFileData.relPath })
+        .then((b64) => { if (!cancelled) setImageBytes(b64); })
+        .catch((e) => { if (!cancelled) console.warn("read_file_bytes failed:", e); })
+        .finally(() => { if (!cancelled) setViewLoading(false); });
+    } else if (viewMode === "diff") {
+      // Diff: pull the most recent backup that contains this file. list_backups
+      // returns newest-first, so the first hit is the latest snapshot.
+      setViewLoading(true);
+      invoke<Array<{ name: string }>>("list_backups", { id: serverId })
+        .then(async (backups) => {
+          for (const b of backups) {
+            const content = await invoke<string | null>("get_file_from_backup", {
+              id: serverId,
+              backupName: b.name,
+              relPath: activeFileData.relPath,
+            }).catch(() => null);
+            if (content && !cancelled) {
+              setDiffOriginal(content);
+              return;
+            }
+          }
+          if (!cancelled) setDiffOriginal("");
+        })
+        .catch((e) => { if (!cancelled) console.warn("list_backups failed:", e); })
+        .finally(() => { if (!cancelled) setViewLoading(false); });
+    }
+    return () => { cancelled = true; };
+  }, [viewMode, activeFile, activeFileData?.relPath, serverId]);
 
   // ── Keyboard shortcuts: Ctrl/Cmd+F to toggle search, Esc to close ───────
   // Both are captured on the *capture* phase but ONLY fire when the Monaco
@@ -555,8 +643,63 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
               onClose={handleCloseFile}
               onSave={handleSave}
             />
+            {/* View-mode toggle: edit | preview | diff.
+                Preview/diff only make sense for files that have a renderer or
+                a backup to compare against; the toggle stays subtle so the
+                editor-first flow is unchanged for code files. */}
+            {activeFileData && (isPreviewable(activeFileData.language) || isImageFile(activeFileData.relPath)) && (
+              <div className="flex items-center gap-1 px-3 h-6 border-b border-grid-bounds bg-bg-surface shrink-0">
+                {(["edit", "preview", "diff"] as const).map((m) => {
+                  const disabled =
+                    m === "diff" ? viewLoading : false;
+                  const available =
+                    m === "edit" ||
+                    (m === "preview" && (isPreviewable(activeFileData.language) || isImageFile(activeFileData.relPath))) ||
+                    m === "diff";
+                  return (
+                    <button
+                      key={m}
+                      disabled={!available || disabled}
+                      onClick={() => setViewMode(m)}
+                      className={`text-[10px] tracking-[0.15em] uppercase transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${
+                        viewMode === m ? "text-signal-high" : "text-zinc-600 hover:text-zinc-300"
+                      }`}
+                    >
+                      {m}
+                    </button>
+                  );
+                })}
+                {viewLoading && <span className="text-[10px] text-zinc-600 ml-2">loading…</span>}
+              </div>
+            )}
             <div className="flex-1 min-h-0">
-              {activeFileData && (
+              {activeFileData && viewMode === "preview" && isImageFile(activeFileData.relPath) && (
+                imageBytes ? (
+                  <ImagePreview base64Content={imageBytes} fileName={activeFile ?? ""} height="100%" />
+                ) : (
+                  <div className="flex items-center justify-center h-full text-[11px] text-zinc-600">
+                    {viewLoading ? "loading…" : "no image data"}
+                  </div>
+                )
+              )}
+              {activeFileData && viewMode === "preview" && !isImageFile(activeFileData.relPath) && isPreviewable(activeFileData.language) && (
+                <FilePreview file={activeFileData} height="100%" />
+              )}
+              {activeFileData && viewMode === "diff" && (
+                diffOriginal !== null ? (
+                  <DiffViewer
+                    original={diffOriginal}
+                    modified={activeContent}
+                    language={activeLanguage}
+                    height="100%"
+                  />
+                ) : (
+                  <div className="flex items-center justify-center h-full text-[11px] text-zinc-600">
+                    {viewLoading ? "loading…" : "no backup found for this file"}
+                  </div>
+                )
+              )}
+              {activeFileData && viewMode === "edit" && (
                 <CodeEditor
                   key={activeFile}
                   language={activeLanguage}
@@ -644,6 +787,52 @@ export function FileEditorPanel({ serverId }: FileEditorPanelProps) {
         onConfirm={handleConfirmDelete}
         onCancel={handleCancelDelete}
       />
+
+      {/* File-conflict dialog — shown when saving would clobber on-disk changes.
+          Three choices: overwrite (force save), reload (discard local edits),
+          or cancel (keep editing). Triggered by the mtime mismatch in B2. */}
+      {conflict && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center"
+          onClick={dismissConflict}
+        >
+          <div className="absolute inset-0 bg-black/60" />
+          <div
+            className="relative z-10 w-full max-w-sm border border-warn-vector/40 bg-bg-surface p-5"
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+          >
+            <h2 className="text-xs text-warn-vector mb-1 tracking-[0.15em] uppercase">
+              File Changed
+            </h2>
+            <p className="text-[11px] text-zinc-400 leading-relaxed mb-4">
+              <span className="text-zinc-200">{conflict}</span> was modified on
+              disk since you last saved. Saving would overwrite those changes.
+            </p>
+            <div className="flex flex-wrap justify-end gap-2">
+              <button
+                onClick={dismissConflict}
+                className="px-3 py-1.5 text-xs text-zinc-400 border border-grid-bounds hover:border-signal-low hover:text-zinc-200 transition-colors"
+              >
+                keep editing
+              </button>
+              <button
+                onClick={() => reloadFile(conflict)}
+                className="px-3 py-1.5 text-xs text-zinc-300 border border-grid-bounds hover:border-signal-low hover:text-zinc-200 transition-colors"
+              >
+                reload from disk
+              </button>
+              <button
+                onClick={() => forceSave(conflict)}
+                className="px-3 py-1.5 text-xs font-semibold text-bg-core bg-fault-vector hover:opacity-80 transition-opacity"
+              >
+                overwrite
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

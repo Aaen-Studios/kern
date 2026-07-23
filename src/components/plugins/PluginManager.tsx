@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { usePlugins } from "../../hooks/usePlugins";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { PluginInstallDialog } from "./PluginInstallDialog";
+import { PluginMarketplace } from "./PluginMarketplace";
 import type { Manifest } from "../../types/manifest";
 
 interface PluginManagerProps {
@@ -22,6 +23,7 @@ interface PluginManagerProps {
 export function PluginManager({ onBack, preselectedKernPath }: PluginManagerProps) {
   const { plugins, loading, error: loadError, refresh } = usePlugins();
   const [installOpen, setInstallOpen] = useState(false);
+  const [marketOpen, setMarketOpen] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [expandedPluginId, setExpandedPluginId] = useState<string | null>(null);
 
@@ -81,12 +83,20 @@ export function PluginManager({ onBack, preselectedKernPath }: PluginManagerProp
             </div>
           </div>
 
-          <button
-            onClick={() => setInstallOpen(true)}
-            className="px-3 py-1.5 text-xs text-bg-core bg-signal-high hover:opacity-80 font-semibold transition-opacity"
-          >
-            + install
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setMarketOpen(true)}
+              className="px-3 py-1.5 text-xs text-zinc-200 border border-signal-low hover:border-signal-high hover:text-signal-high transition-colors"
+            >
+              browse marketplace
+            </button>
+            <button
+              onClick={() => setInstallOpen(true)}
+              className="px-3 py-1.5 text-xs text-bg-core bg-signal-high hover:opacity-80 font-semibold transition-opacity"
+            >
+              + install
+            </button>
+          </div>
         </div>
       </div>
 
@@ -215,6 +225,11 @@ export function PluginManager({ onBack, preselectedKernPath }: PluginManagerProp
         onInstalled={handleInstalled}
         initialPath={preselectedPath ?? undefined}
       />
+
+      {/* ── Marketplace browser ─────────────────────────────────────── */}
+      {marketOpen && (
+        <PluginMarketplace onClose={() => setMarketOpen(false)} />
+      )}
     </div>
   );
 }

@@ -7,10 +7,15 @@ mod java;
 mod manifest;
 mod metrics;
 mod process;
+mod registry;
+mod scheduler;
 mod scaffold;
 mod seed;
+mod sync;
 mod tray;
 mod ui_state;
+mod watcher;
+mod web_remote;
 mod window_state;
 
 use tauri::{Listener, Manager, WindowEvent};
@@ -47,6 +52,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(process::ProcessRegistry::default())
         .manage(metrics::MetricsState::default())
+        .manage(metrics::MetricsHistory::default())
+        .manage(watcher::WatcherState::default())
         .setup(|app| {
             let handle = app.handle().clone();
 
@@ -102,8 +109,20 @@ pub fn run() {
             // Spawned on background threads so a slow start (e.g. a JAR that
             // takes a moment to resolve) can't block setup.
             if let Ok(cfg) = config::load_config(&handle) {
+                // ── Reconcile persisted pids against the live process table ──
+                // On a previous quit, detach_all left running servers alive in
+                // the OS but dropped kern's handles. Each launch persisted its
+                // pid; here we sysinfo-probe each and re-adopt live ones as
+                // PID-only monitors (liveness + metrics + force-kill; no stdin
+                // pipe, so no graceful stop or log streaming for these). Dead
+                // pids are cleared so they don't linger.
+                let alive_ids = reconcile_adopted(&handle, &cfg);
+
+                // ── Auto-start flagged instances ──
+                // Skipped for already-running (owned or re-adopted) instances
+                // so we never double-launch into the same port/working dir.
                 for server in cfg.servers.values() {
-                    if server.auto_start && !server.is_orphaned {
+                    if server.auto_start && !server.is_orphaned && !alive_ids.contains(&server.id) {
                         let h = handle.clone();
                         let id = server.id.clone();
                         tauri::async_runtime::spawn(async move {
@@ -117,6 +136,13 @@ pub fn run() {
                     }
                 }
             }
+
+            // Spawn the background worker: backup scheduler, health alerts,
+            // and metrics-history sampling all run on one 30s loop.
+            scheduler::spawn(&handle);
+
+            // Optionally serve the web remote (LAN JSON API) if enabled.
+            web_remote::maybe_spawn(&handle);
 
             Ok(())
         })
@@ -143,6 +169,15 @@ pub fn run() {
                             window_state::set_hidden(&handle, true);
                         }
                         tray::refresh_menu(&handle);
+                    } else {
+                        // Real close: detach all child processes first, so a
+                        // running server isn't abruptly orphaned with its stdin
+                        // closed mid-save (only the tray Quit path did this
+                        // before). detach_all leaves the processes running but
+                        // cleanly disconnects the registry's handles.
+                        let registry: tauri::State<'_, process::ProcessRegistry> =
+                            handle.state();
+                        registry.detach_all();
                     }
                 }
                 _ => {}
@@ -204,6 +239,21 @@ pub fn run() {
             commands::restore_world,
             commands::delete_backup,
             commands::detect_server_jar,
+            commands::run_terminal_command,
+            commands::update_backup_schedule,
+            commands::update_alert_rules,
+            commands::get_metrics_history,
+            commands::get_instance_energy,
+            commands::update_command_snippets,
+            commands::get_instance_ports,
+            commands::find_replace_in_files,
+            registry::registry_list_plugins,
+            registry::registry_get_plugin,
+            registry::registry_install_plugin,
+            sync::sync_export,
+            sync::sync_import,
+            watcher::watch_server_directory,
+            watcher::unwatch_server_directory,
             java::detect_java,
             java::check_java_version,
             java::download_java,
@@ -212,4 +262,64 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Probes each instance's persisted `pid` against the live OS process table and
+/// re-adopts still-running ones as PID-only monitors. Returns the set of ids
+/// that are now running (owned or adopted) so the auto-start loop can skip them.
+///
+/// Dead pids are cleared from config so they don't linger. This runs once at
+/// startup, before auto-start, so a server still alive from a previous session
+/// is recognized rather than double-launched.
+fn reconcile_adopted(
+    handle: &tauri::AppHandle,
+    cfg: &config::AppConfig,
+) -> Vec<String> {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    let registry: tauri::State<'_, process::ProcessRegistry> = handle.state();
+
+    // Collect candidate (id, pid) pairs from config.
+    let candidates: Vec<(String, u32)> = cfg
+        .servers
+        .iter()
+        .filter_map(|(id, s)| s.pid.map(|p| (id.clone(), p)))
+        .collect();
+
+    if candidates.is_empty() {
+        return registry.running_ids();
+    }
+
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+
+    let mut alive = Vec::new();
+    let mut dead = Vec::new();
+    for (id, pid) in candidates {
+        if sys.process(Pid::from_u32(pid)).is_some() {
+            registry.adopt(handle, &id, pid);
+            alive.push(id);
+        } else {
+            dead.push(id);
+        }
+    }
+
+    // Clear persisted pids for everything we just reconciled. For alive ones
+    // the adopted registry now tracks them in-memory this session; for dead
+    // ones the pid is stale. Either way, leaving it would risk a bogus re-adopt.
+    let to_clear: Vec<String> = alive.iter().chain(dead.iter()).cloned().collect();
+    if !to_clear.is_empty() {
+        let clear_handle = handle.clone();
+        let _ = config::with_config_mut(&clear_handle, |c| {
+            for id in &to_clear {
+                if let Some(instance) = c.servers.get_mut(id) {
+                    instance.pid = None;
+                }
+            }
+            Ok(())
+        });
+    }
+
+    // Owned processes (if any launched earlier in setup) + adopted ones.
+    registry.running_ids()
 }

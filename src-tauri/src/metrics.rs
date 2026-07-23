@@ -135,3 +135,69 @@ impl MetricsState {
         })
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Historical metrics — a rolling in-memory ring buffer sampled by the
+// background worker. Powers the 24h/7d resource graphs. Kept in memory (not
+// persisted) to avoid write churn; a long-running host accumulates plenty.
+// ──────────────────────────────────────────────────────────────────────────
+
+use std::collections::VecDeque;
+
+/// A single telemetry sample at a point in time.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricSample {
+    /// Epoch seconds.
+    pub at: u64,
+    /// CPU fraction 0.0..=1.0.
+    pub cpu: f32,
+    /// RAM fraction 0.0..=1.0.
+    pub ram: f32,
+}
+
+/// How long a sample is retained. ~7 days at a 60s cadence ≈ 10k samples.
+const MAX_SAMPLES: usize = 10_000;
+
+/// Per-instance rolling history. Keyed by instance id.
+#[derive(Default)]
+pub struct MetricsHistory(pub Mutex<std::collections::HashMap<String, VecDeque<MetricSample>>>);
+
+impl MetricsHistory {
+    /// Appends a sample for an instance, capping the buffer length.
+    pub fn record(&self, id: &str, sample: MetricSample) {
+        if let Ok(mut map) = self.0.lock() {
+            let buf = map.entry(id.to_string()).or_default();
+            buf.push_back(sample);
+            while buf.len() > MAX_SAMPLES {
+                buf.pop_front();
+            }
+        }
+    }
+
+    /// Returns samples within `[since_secs, now]`, oldest first.
+    pub fn query(&self, id: &str, since_secs: u64) -> Vec<MetricSample> {
+        let Ok(map) = self.0.lock() else {
+            return Vec::new();
+        };
+        let Some(buf) = map.get(id) else {
+            return Vec::new();
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let cutoff = now.saturating_sub(since_secs);
+        buf.iter()
+            .filter(|s| s.at >= cutoff)
+            .copied()
+            .collect()
+    }
+
+    /// Drops history for a deleted instance.
+    pub fn forget(&self, id: &str) {
+        if let Ok(mut map) = self.0.lock() {
+            map.remove(id);
+        }
+    }
+}

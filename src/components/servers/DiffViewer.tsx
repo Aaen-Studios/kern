@@ -1,18 +1,31 @@
 /**
  * Diff viewer component using Monaco's DiffEditor.
  *
- * Compares two file contents and shows the differences with green/red highlights.
- * Used for comparing current files with backup versions.
+ * Compares two file contents and shows the differences with green/red
+ * highlights. Used for comparing the working copy against a backup version.
+ *
+ * Implementation note: we use `@monaco-editor/react`'s `DiffEditor` in its
+ * declarative form — passing `original` / `modified` / `language` as props and
+ * letting the wrapper own model lifecycle. The previous version manually
+ * created models via `editor.createModel` and called `setModel` on a cast
+ * editor handle, which crashed on this Monaco version ("model.getLanguageId
+ * is not a function") and — because it ran setup at module scope — took down
+ * the entire view that imported it.
  */
 
-import { useCallback, useMemo } from "react";
-import DiffEditor, { loader, type OnMount } from "@monaco-editor/react";
-import type * as monaco from "monaco-editor";
+import { DiffEditor, loader } from "@monaco-editor/react";
 import * as monacoEditor from "monaco-editor";
+import type * as monaco from "monaco-editor";
 import { KERN_THEME } from "./editorTheme";
 import { registerCustomLanguages } from "./monarchLanguages";
 
 loader.config({ monaco: monacoEditor });
+
+// Register the theme + custom languages once. defineTheme is idempotent, and
+// registerCustomLanguages guards against double-registration internally, so
+// importing this module multiple times (e.g. via code-splitting) is safe.
+monacoEditor.editor.defineTheme("kern-dark", KERN_THEME);
+registerCustomLanguages(monacoEditor);
 
 interface DiffViewerProps {
   /** Original content (left side). */
@@ -25,43 +38,21 @@ interface DiffViewerProps {
   height?: string;
 }
 
-// Register theme once at module level
-monacoEditor.editor.defineTheme("kern-dark", KERN_THEME);
-registerCustomLanguages(monacoEditor);
-
 /**
  * Monaco-based diff viewer showing deletions (red) and insertions (green).
+ *
+ * Read-only and side-by-side. The wrapper manages models from the props, so
+ * updating `original`/`modified` re-diffs automatically.
  */
 export function DiffViewer({ original, modified, language, height = "400px" }: DiffViewerProps) {
-  const originalModel = useMemo(() => {
-    const m = monacoEditor.editor.createModel(original, language);
-    return m;
-  }, [original, language]);
-
-  const modifiedModel = useMemo(() => {
-    const m = monacoEditor.editor.createModel(modified, language);
-    return m;
-  }, [modified, language]);
-
-  const handleMount: OnMount = useCallback(
-    (ed: monacoEditor.editor.IStandaloneCodeEditor) => {
-      // The editor is a DiffEditor, need to set models
-      const diffEd = ed as unknown as monacoEditor.editor.IStandaloneDiffEditor;
-      diffEd.setModel({
-        original: originalModel,
-        modified: modifiedModel,
-      });
-      monacoEditor.editor.setTheme("kern-dark");
-    },
-    [originalModel, modifiedModel],
-  );
-
   return (
     <div style={{ height }} className="border-t border-grid-bounds bg-bg-core">
       <DiffEditor
-        onMount={handleMount}
+        original={original}
+        modified={modified}
+        language={language}
+        theme="kern-dark"
         options={{
-          theme: "kern-dark",
           readOnly: true,
           renderSideBySide: true,
           ignoreWhitespace: false,

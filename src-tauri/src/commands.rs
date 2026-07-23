@@ -5,7 +5,6 @@
 //! §5 (Phase 2 — variable process lifecycle execution + log streaming).
 
 use std::collections::HashMap;
-use std::fs;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::io::Write;
@@ -18,7 +17,7 @@ use tauri_plugin_autostart::ManagerExt;
 
 use crate::config::{self, AppConfig, AppSettings, ServerInstance};
 use crate::manifest;
-use crate::metrics::{InstanceMetrics, MetricsState};
+use crate::metrics::{InstanceMetrics, MetricSample, MetricsHistory, MetricsState};
 use crate::process;
 use crate::scaffold;
 
@@ -78,6 +77,11 @@ pub fn create_server(
         is_orphaned: false,
         user_overrides: input.user_overrides.clone(),
         auto_start: input.auto_start,
+        pid: None,
+        backup_schedule: config::BackupSchedule::default(),
+        alert_rules: config::AlertRules::default(),
+        command_history: Vec::new(),
+        command_snippets: Vec::new(),
     };
 
     cfg.servers.insert(instance.id.clone(), instance.clone());
@@ -152,6 +156,9 @@ pub fn delete_server(app_handle: AppHandle, id: String) -> Result<(), String> {
     let mut cfg = config::load_config(&app_handle)?;
     cfg.servers.remove(&id);
     config::save_config(&app_handle, &cfg)?;
+    // Drop accumulated metrics history for the deleted instance.
+    let history: tauri::State<'_, MetricsHistory> = app_handle.state();
+    history.forget(&id);
     Ok(())
 }
 
@@ -268,11 +275,14 @@ pub struct RunningServerInfo {
     pub id: String,
     pub name: String,
     pub pid: u32,
+    /// True if this is a re-adopted PID-only monitor (no Child handle, so no
+    /// graceful stop or live log streaming). The UI surfaces this distinctly.
+    pub adopted: bool,
 }
 
-/// Lists every currently-running instance (id, name, pid). Names are resolved
-/// from the persisted registry; an id with no matching registry entry (e.g.
-/// deleted while running) falls back to the id.
+/// Lists every currently-running instance (id, name, pid, adopted). Names are
+/// resolved from the persisted registry; an id with no matching registry entry
+/// (e.g. deleted while running) falls back to the id.
 #[tauri::command]
 pub fn list_running_servers(app_handle: AppHandle) -> Result<Vec<RunningServerInfo>, String> {
     let registry: tauri::State<'_, process::ProcessRegistry> = app_handle.state();
@@ -287,7 +297,8 @@ pub fn list_running_servers(app_handle: AppHandle) -> Result<Vec<RunningServerIn
                 .map(|s| s.name.clone())
                 .unwrap_or_else(|| id.clone());
             let pid = registry.pid_for(&id).unwrap_or(0);
-            RunningServerInfo { id, name, pid }
+            let adopted = registry.is_adopted(&id);
+            RunningServerInfo { id, name, pid, adopted }
         })
         .collect();
     Ok(infos)
@@ -337,6 +348,158 @@ pub fn get_instance_metrics(
 pub fn get_host_metrics(app_handle: AppHandle) -> Result<InstanceMetrics, String> {
     let state: tauri::State<'_, MetricsState> = app_handle.state();
     Ok(state.host_metrics())
+}
+
+/// A listening TCP port attributed to an instance's process tree.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListeningPort {
+    pub port: u16,
+    /// Suggested quick-connect string, e.g. "localhost:25565".
+    pub connect: String,
+}
+
+/// Returns the TCP listening ports owned by an instance's process tree.
+///
+/// Builds the descendant-PID set via sysinfo's parent pointers, then matches
+/// them against the OS socket table via `netstat` (Windows) / `ss` (Linux) /
+/// `lsof` (macOS) — sysinfo 0.32 doesn't expose listening sockets directly.
+/// Used by the port viewer / quick-connect feature so the user can copy a
+/// join link without reading logs.
+#[tauri::command]
+pub fn get_instance_ports(app_handle: AppHandle, id: String) -> Result<Vec<ListeningPort>, String> {
+    use sysinfo::{Pid, ProcessesToUpdate};
+    let Some(root_pid) = process::pid_for(&app_handle, &id) else {
+        return Ok(Vec::new());
+    };
+    let state: tauri::State<'_, MetricsState> = app_handle.state();
+    let Ok(mut sys) = state.0.lock() else {
+        return Ok(Vec::new());
+    };
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+
+    // Collect the full descendant set starting from root_pid.
+    let mut tree: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    tree.insert(root_pid);
+    loop {
+        let mut grew = false;
+        let current: Vec<u32> = tree.iter().copied().collect();
+        for pid in current {
+            let sp = Pid::from_u32(pid);
+            if sys.process(sp).is_some() {
+                for (cpid, child) in sys.processes() {
+                    if child.parent() == Some(sp) && tree.insert(cpid.as_u32()) {
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    // Query the OS socket table and keep listening TCP ports whose owning PID
+    // is in the instance's process tree.
+    let listening_lines = query_listening_sockets();
+    let mut ports: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+    for (pid, port) in listening_lines {
+        if tree.contains(&pid) {
+            ports.insert(port);
+        }
+    }
+
+    let result = ports
+        .into_iter()
+        .map(|p| ListeningPort {
+            port: p,
+            connect: format!("localhost:{p}"),
+        })
+        .collect();
+    Ok(result)
+}
+
+/// Runs `netstat -ano` (Windows) / `ss -tlnp` (Linux) / `lsof -iTCP -sTCP:LISTEN`
+/// (macOS) and returns `(pid, local_listening_port)` pairs. Best-effort: an
+/// empty Vec on any parse failure.
+fn query_listening_sockets() -> Vec<(u32, u16)> {
+    use std::process::Command;
+    let out = if cfg!(target_os = "windows") {
+        Command::new("netstat")
+            .args(["-ano", "-p", "TCP"])
+            .output()
+    } else if cfg!(target_os = "macos") {
+        Command::new("lsof")
+            .args(["-nP", "-iTCP", "-sTCP:LISTEN"])
+            .output()
+    } else {
+        Command::new("ss").args(["-tlnp"]).output()
+    };
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_listening(&text)
+}
+
+/// Parses netstat/ss/lsof output into (pid, port) pairs for LISTENING rows.
+fn parse_listening(text: &str) -> Vec<(u32, u16)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let lower = line.to_lowercase();
+        // Only rows that are actually listening.
+        if !(lower.contains("listen") || lower.contains("listening")) {
+            continue;
+        }
+        // Extract the local port from the address token (last :port on the line
+        // segment that looks like an addr). Extract the pid from the tail.
+        let port = extract_port(&lower);
+        let pid = extract_pid(&lower);
+        if let (Some(p), Some(pid)) = (port, pid) {
+            out.push((pid, p));
+        }
+    }
+    out
+}
+
+/// Pulls the local listening port out of a netstat/ss/lsof line.
+fn extract_port(line: &str) -> Option<u16> {
+    // Address forms: "0.0.0.0:25565", "[::]:25565", "*:25565".
+    // Find the last ":NNNN" that isn't the pid column.
+    let mut last: Option<u16> = None;
+    for tok in line.split_whitespace() {
+        if let Some(idx) = tok.rfind(':') {
+            if let Ok(p) = tok[idx + 1..].trim_end_matches(']').parse::<u16>() {
+                // Heuristic: ports are <= 65535 and the addr token contains a dot or colon-bracket.
+                if tok.contains('.') || tok.contains('[') || tok.contains('*') {
+                    last = Some(p);
+                }
+            }
+        }
+    }
+    last
+}
+
+/// Pulls the owning PID out of the tail of a netstat/ss/lsof line.
+fn extract_pid(line: &str) -> Option<u32> {
+    // Look for "pid=<n>" (ss) or a trailing integer (netstat) or " <n> " (lsof).
+    if let Some(idx) = line.find("pid=") {
+        let rest = &line[idx + 4..];
+        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(p) = num.parse::<u32>() {
+            return Some(p);
+        }
+    }
+    // netstat -ano: the last whitespace token is the PID.
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    for t in tokens.iter().rev() {
+        if t.chars().all(|c| c.is_ascii_digit()) && !t.is_empty() {
+            if let Ok(p) = t.parse::<u32>() {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 /// Locates the manifest for a plugin id under `<app_data>/plugins/<id>/`.
@@ -436,6 +599,17 @@ fn run_step(app_handle: &AppHandle, id: &str, step_name: &str) -> Result<(), Str
             return Err(e);
         }
         set_status(app_handle, id, "running")?;
+        // Persist the pid so a subsequent app restart can re-adopt the still-
+        // running process instead of leaving it invisible. Best-effort: a write
+        // failure here doesn't undo a successful launch.
+        if let Some(pid) = process::pid_for(app_handle, id) {
+            let _ = config::with_config_mut(app_handle, |cfg| {
+                if let Some(instance) = cfg.servers.get_mut(id) {
+                    instance.pid = Some(pid);
+                }
+                Ok(())
+            });
+        }
         return Ok(());
     }
 
@@ -842,7 +1016,23 @@ pub fn restart_server_instance(app_handle: AppHandle, id: String) -> Result<(), 
     // Brief pause lets the OS release resources before re-spawning.
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    run_step(&app_handle, &id, "start")
+    // Retry the re-spawn a few times: on a slow host the OS may not have
+    // finished releasing the port/socket yet, and a single attempt can fail
+    // spuriously even though nothing is actually wrong. Surfacing the error
+    // only after several tries avoids confusing "restart failed" errors.
+    const RESTART_MAX_ATTEMPTS: u32 = 3;
+    const RESTART_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+    let mut last_err: Option<String> = None;
+    for _ in 0..RESTART_MAX_ATTEMPTS {
+        match run_step(&app_handle, &id, "start") {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(RESTART_RETRY_DELAY);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "restart failed for unknown reason".to_string()))
 }
 
 /// Stops a running instance. Idempotent — Ok if it wasn't running.
@@ -853,6 +1043,22 @@ pub fn restart_server_instance(app_handle: AppHandle, id: String) -> Result<(), 
 /// last autosave that a raw process kill would cause.
 #[tauri::command]
 pub fn stop_server_instance(app_handle: AppHandle, id: String) -> Result<(), String> {
+    // Re-adopted (PID-only) processes have no stdin pipe, so graceful shutdown
+    // is impossible — force-kill them directly. Owned processes get the normal
+    // graceful path (write `stop`, wait, hard-kill on timeout).
+    if process::is_adopted(&app_handle, &id) {
+        set_status(&app_handle, &id, "stopping")?;
+        process::force_kill_adopted(&app_handle, &id)?;
+        set_status(&app_handle, &id, "stopped")?;
+        // Clear the persisted pid so it isn't re-adopted next launch.
+        config::with_config_mut(&app_handle, |cfg| {
+            if let Some(instance) = cfg.servers.get_mut(&id) {
+                instance.pid = None;
+            }
+            Ok(())
+        })?;
+        return Ok(());
+    }
     set_status(&app_handle, &id, "stopping")?;
     process::stop_graceful(&app_handle, &id, GRACEFUL_STOP_TIMEOUT)?;
     set_status(&app_handle, &id, "stopped")?;
@@ -970,6 +1176,115 @@ pub fn run_instance_command(
     } else {
         let code = status.code().map_or("unknown".to_string(), |c| c.to_string());
         set_status(&app_handle, &id, "error")?;
+        Err(format!("command exited with code {code}"))
+    }
+}
+
+/// Runs an ad-hoc command line in an instance's working directory (used when
+/// the user types something that isn't a lifecycle keyword while the server is
+/// idle — see `ServerDetailView.tsx` ad-hoc terminal path).
+///
+/// Unlike [`run_instance_command`], this does **not** flip the instance status
+/// (the server isn't actually running — we're just running a one-off helper
+/// command like `ls`, `cat`, or `git status`). Output is streamed live to the
+/// same `log:<id>:stream` channel and appended to `latest.log`, so it appears
+/// inline in the terminal the user typed into.
+///
+/// `line` is the full trimmed input, run through the OS shell (`cmd.exe /C` on
+/// Windows, `sh -c` on Unix) so builtins like `dir`, `echo`, `type`, `set`,
+/// `ls`, pipes, and redirects all resolve — typing into the terminal behaves
+/// the way a user expects. The shell runs scoped to the instance directory.
+#[tauri::command]
+pub fn run_terminal_command(
+    app_handle: AppHandle,
+    id: String,
+    line: String,
+) -> Result<(), String> {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use tauri::Emitter;
+
+    // 1. Load + validate instance.
+    let cfg = config::load_config(&app_handle)?;
+    let instance = cfg
+        .servers
+        .get(&id)
+        .ok_or_else(|| format!("server '{id}' not found"))?
+        .clone();
+    if instance.is_orphaned {
+        return Err(format!(
+            "instance '{id}' is orphaned (path missing): {}",
+            instance.path
+        ));
+    }
+
+    let working_dir = std::path::Path::new(&instance.path);
+    let log_path = working_dir.join("latest.log");
+
+    // 2. Build the command via the OS shell so builtins/pipes/redirects work.
+    let mut cmd = process::build_adhoc_shell_command(&line);
+    cmd.current_dir(working_dir);
+    let env_path = working_dir.join(".env");
+    for (k, v) in parse_env_file(&env_path) {
+        cmd.env(k, v);
+    }
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    process::suppress_window(&mut cmd);
+
+    // 3. Spawn.
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn '{line}': {e}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "spawned child has no stdout pipe".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "spawned child has no stderr pipe".to_string())?;
+
+    let event_name = format!("log:{id}:stream");
+
+    // 4. Stream stdout + stderr concurrently to the terminal + latest.log.
+    let handle = app_handle.clone();
+    let log_path_stdout = log_path.clone();
+    let event_out = event_name.clone();
+    let stdout_thread = std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().flatten() {
+            let stamped = forward_to_log(&handle, &event_out, &log_path_stdout, &line);
+            let _ = handle.emit(&event_out, stamped);
+        }
+    });
+
+    let handle_err = app_handle.clone();
+    let log_path_stderr = log_path.clone();
+    let event_err = event_name.clone();
+    let stderr_thread = std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().flatten() {
+            let stamped = forward_to_log(&handle_err, &event_err, &log_path_stderr, &line);
+            let _ = handle_err.emit(&event_err, stamped);
+        }
+    });
+
+    // 5. Wait for readers + child. Status is intentionally left untouched —
+    //    this is an ad-hoc command, not a server lifecycle transition.
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("failed to wait for child: {e}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        let code = status.code().map_or("unknown".to_string(), |c| c.to_string());
         Err(format!("command exited with code {code}"))
     }
 }
@@ -1117,23 +1432,59 @@ pub fn write_stdin_to_instance(
 }
 
 /// Returns the tail of an instance's latest.log (last `max_lines`).
+///
+/// Bounds memory: if the file exceeds `TAIL_BYTES_CAP`, only the trailing
+/// `TAIL_BYTES_CAP` bytes are read (via a seek from EOF) and then split into
+/// lines. A multi-GB `latest.log` no longer gets slurped into a single String.
+/// The first line of a truncated tail is likely partial and is dropped.
 #[tauri::command]
 pub fn get_log_tail(
     app_handle: AppHandle,
     id: String,
     max_lines: Option<usize>,
 ) -> Result<Vec<String>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const TAIL_BYTES_CAP: u64 = 2 * 1024 * 1024; // 2 MiB
+
     let cfg = config::load_config(&app_handle)?;
     let instance = cfg
         .servers
         .get(&id)
         .ok_or_else(|| format!("server '{id}' not found"))?;
     let log_path = PathBuf::from(&instance.path).join("latest.log");
-    if !log_path.exists() {
-        return Ok(Vec::new());
-    }
-    let raw = fs::read_to_string(&log_path)
-        .map_err(|e| format!("failed to read '{}': {e}", log_path.display()))?;
+
+    let mut file = match std::fs::File::open(&log_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("failed to open '{}': {e}", log_path.display())),
+    };
+
+    let file_len = file
+        .metadata()
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let raw: String = if file_len > TAIL_BYTES_CAP {
+        // Seek to (EOF - cap) and read only the tail. The first line in that
+        // slice is almost certainly cut mid-way, so drop it.
+        file.seek(SeekFrom::End(-(TAIL_BYTES_CAP as i64)))
+            .map_err(|e| format!("seek failed: {e}"))?;
+        let mut buf = Vec::with_capacity(TAIL_BYTES_CAP as usize);
+        file.read_to_end(&mut buf)
+            .map_err(|e| format!("read failed: {e}"))?;
+        let s = String::from_utf8_lossy(&buf).into_owned();
+        match s.find('\n') {
+            Some(idx) => s[idx + 1..].to_string(),
+            None => String::new(), // whole cap was one giant line
+        }
+    } else {
+        let mut s = String::new();
+        file.read_to_string(&mut s)
+            .map_err(|e| format!("failed to read '{}': {e}", log_path.display()))?;
+        s
+    };
+
     let mut lines: Vec<&str> = raw.lines().collect();
     let limit = max_lines.unwrap_or(500);
     if lines.len() > limit {
@@ -1142,15 +1493,19 @@ pub fn get_log_tail(
     Ok(lines.iter().map(|s| s.to_string()).collect())
 }
 
-/// Helper: writes a new status for an instance and persists it. Re-reads the
-/// config first to avoid clobbering concurrent edits.
+/// Helper: writes a new status for an instance and persists it.
+///
+/// Goes through `with_config_mut` so this background-thread write (from the
+/// stdout reader) can't clobber a concurrent user-driven change — e.g. it
+/// won't revert a server deletion that races it, or drop a sibling instance's
+/// status update.
 fn set_status(app_handle: &AppHandle, id: &str, status: &str) -> Result<(), String> {
-    let mut cfg = config::load_config(app_handle)?;
-    if let Some(instance) = cfg.servers.get_mut(id) {
-        instance.status = status.to_string();
-        config::save_config(app_handle, &cfg)?;
-    }
-    Ok(())
+    config::with_config_mut(app_handle, |cfg| {
+        if let Some(instance) = cfg.servers.get_mut(id) {
+            instance.status = status.to_string();
+        }
+        Ok(())
+    })
 }
 
 /// Reads a specific variable from an instance's .env file.
@@ -1195,20 +1550,63 @@ pub fn server_file_exists(app_handle: AppHandle, id: String, rel_path: String) -
 
 /// Writes content to a relative file inside an instance's working directory.
 /// Creates parent directories if missing. Used for marker files like `.installed`.
+///
+/// Conflict detection: if `expected_mtime` is provided (epoch seconds, as
+/// returned by a prior read/write), the file's current mtime is compared first.
+/// A mismatch means the file changed on disk since the editor last saw it
+/// (running server rewriting `server.properties`, external editor, or the live
+/// watcher firing) — writing would clobber that. Returns `Err("conflict:...")`
+/// so the frontend can prompt instead of silently overwriting.
+///
+/// Returns the new file mtime (epoch seconds) on success, so the editor can
+/// update its conflict-detection baseline.
 #[tauri::command]
-pub fn write_server_file(app_handle: AppHandle, id: String, rel_path: String, content: String) -> Result<(), String> {
+pub fn write_server_file(
+    app_handle: AppHandle,
+    id: String,
+    rel_path: String,
+    content: String,
+    expected_mtime: Option<f64>,
+) -> Result<f64, String> {
     let cfg = config::load_config(&app_handle)?;
     let instance = cfg
         .servers
         .get(&id)
         .ok_or_else(|| format!("server '{id}' not found"))?;
     let target = resolve_path(&instance.path, &rel_path)?;
+
+    // Conflict check: only when the caller knows the last-known mtime.
+    if let Some(expected) = expected_mtime {
+        if let Ok(meta) = std::fs::metadata(&target) {
+            let current = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            if (current - expected).abs() > f64::EPSILON {
+                return Err(format!(
+                    "conflict: '{rel_path}' changed on disk since you last saved"
+                ));
+            }
+        }
+    }
+
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create parent dirs: {e}"))?;
     }
     std::fs::write(&target, &content)
-        .map_err(|e| format!("failed to write '{rel_path}': {e}"))
+        .map_err(|e| format!("failed to write '{rel_path}': {e}"))?;
+
+    // Return the fresh mtime so the editor updates its baseline.
+    let mtime = std::fs::metadata(&target)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    Ok(mtime)
 }
 
 /// A single entry in a directory listing.
@@ -1253,9 +1651,21 @@ fn resolve_path(instance_root: &str, rel_path: &str) -> Result<std::path::PathBu
     Ok(target)
 }
 
+/// A file's content paired with its on-disk mtime (epoch seconds).
+///
+/// The mtime is the editor's conflict-detection baseline: on save it's passed
+/// back as `expected_mtime`, and a mismatch means the file was changed
+/// externally and shouldn't be silently overwritten.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileContent {
+    pub content: String,
+    pub mtime: f64,
+}
+
 /// Reads a file's content from an instance's working directory.
 #[tauri::command]
-pub fn read_server_file(app_handle: AppHandle, id: String, rel_path: String) -> Result<String, String> {
+pub fn read_server_file(app_handle: AppHandle, id: String, rel_path: String) -> Result<FileContent, String> {
     let cfg = config::load_config(&app_handle)?;
     let instance = cfg
         .servers
@@ -1265,8 +1675,15 @@ pub fn read_server_file(app_handle: AppHandle, id: String, rel_path: String) -> 
     if !target.is_file() {
         return Err(format!("'{}' is not a file or does not exist", rel_path));
     }
-    std::fs::read_to_string(&target)
-        .map_err(|e| format!("failed to read '{rel_path}': {e}"))
+    let content = std::fs::read_to_string(&target)
+        .map_err(|e| format!("failed to read '{rel_path}': {e}"))?;
+    let mtime = std::fs::metadata(&target)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    Ok(FileContent { content, mtime })
 }
 
 /// Lists the contents of a directory inside an instance's working directory.
@@ -1796,6 +2213,28 @@ fn add_dir_to_zip(
     Ok(())
 }
 
+/// Joins a zip entry's name onto `dst` only if the name is safe (no `..` or
+/// absolute components that would escape `dst`). Returns `None` for unsafe
+/// names — this is the zip-slip traversal guard.
+///
+/// `enclosed_name()` already does the heavy lifting: it normalizes the entry
+/// path and returns `None` when it would escape the base. We additionally
+/// double-check the canonicalized result stays under `dst` after joining, as
+/// defense in depth (symlinks, case-insensitive roots, etc.).
+fn safe_zip_join(dst: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    // Reject obvious traversal attempts up front (enclosed_name handles the
+    // subtle cases, but being explicit makes the intent clear).
+    let joined = dst.join(name);
+    let canonical_dst = dst.canonicalize().unwrap_or_else(|_| dst.to_path_buf());
+    // If the joined path doesn't yet exist, compare against the parent.
+    let canonical_joined = joined.canonicalize().unwrap_or_else(|_| joined.clone());
+    if canonical_joined.starts_with(&canonical_dst) {
+        Some(joined)
+    } else {
+        None
+    }
+}
+
 /// Extracts a .kern (zip) archive to the specified destination.
 fn extract_kern_archive(archive_path: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
     use std::io::Read;
@@ -1808,7 +2247,26 @@ fn extract_kern_archive(archive_path: &std::path::Path, dst: &std::path::Path) -
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)
             .map_err(|e| format!("failed to read archive entry: {e}"))?;
-        let outpath = dst.join(file.name());
+
+        // Zip-slip guard: enclosed_name() returns None for paths that would
+        // escape `dst` (e.g. "../../Startup/foo.bat"). A malicious .kern
+        // could otherwise write anywhere on disk — and .kern files are
+        // installable via double-click/deep-link, so this is reachable by an
+        // attacker. Reject such entries outright.
+        let Some(safe_name) = file.enclosed_name() else {
+            return Err(format!(
+                "archive entry '{}' is unsafe (path traversal) — refusing to extract",
+                file.name()
+            ));
+        };
+        let outpath = dst.join(safe_name);
+        // Defense in depth: re-check the resolved path stays under dst.
+        if safe_zip_join(dst, file.name()).is_none() {
+            return Err(format!(
+                "archive entry '{}' resolves outside the destination — refusing to extract",
+                file.name()
+            ));
+        }
 
         if file.is_dir() {
             std::fs::create_dir_all(&outpath)
@@ -1840,10 +2298,16 @@ fn extract_kern_archive(archive_path: &std::path::Path, dst: &std::path::Path) -
 /// should ideally run `save-all` first to flush chunk data to disk.
 #[tauri::command]
 pub fn backup_world(app_handle: AppHandle, id: String) -> Result<String, String> {
-    let cfg = config::load_config(&app_handle)?;
+    backup_world_impl(&app_handle, &id)
+}
+
+/// Implementation usable from non-command contexts (the scheduler thread).
+/// Same behavior as the command; takes a borrowed handle + id.
+pub fn backup_world_impl(app_handle: &AppHandle, id: &str) -> Result<String, String> {
+    let cfg = config::load_config(app_handle)?;
     let instance = cfg
         .servers
-        .get(&id)
+        .get(id)
         .ok_or_else(|| format!("server '{id}' not found"))?;
 
     let root = PathBuf::from(&instance.path);
@@ -1948,6 +2412,33 @@ pub fn list_backups(app_handle: AppHandle, id: String) -> Result<Vec<serde_json:
     Ok(entries)
 }
 
+/// Prunes old backups beyond `keep`, keeping the newest `keep` archives.
+/// Used by the scheduler's rolling retention. Best-effort: logs failures.
+pub fn prune_backups_impl(app_handle: &AppHandle, id: &str, keep: u32) {
+    let Ok(cfg) = config::load_config(app_handle) else {
+        return;
+    };
+    let Some(instance) = cfg.servers.get(id) else {
+        return;
+    };
+    let backups_dir = PathBuf::from(&instance.path).join("backups");
+    let Ok(entries) = std::fs::read_dir(&backups_dir) else {
+        return;
+    };
+    // Collect zip names, newest first (epoch-second names sort monotonically).
+    let mut zips: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("zip"))
+        .collect();
+    zips.sort_by(|a, b| b.cmp(a));
+    for old in zips.into_iter().skip(keep as usize) {
+        if let Err(e) = std::fs::remove_file(&old) {
+            eprintln!("[backup] failed to prune '{}': {e}", old.display());
+        }
+    }
+}
+
 /// Restores a world from a backup archive. Backs up the current world first
 /// (safety copy), then replaces `world/` contents with the archive's contents.
 #[tauri::command]
@@ -2024,7 +2515,22 @@ pub fn restore_world(
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).map_err(|e| format!("archive error: {e}"))?;
-        let outpath = world_dir.join(file.name());
+
+        // Zip-slip guard (same as extract_kern_archive): a backup entry whose
+        // path escapes world/ is rejected rather than written outside it.
+        let Some(safe_name) = file.enclosed_name() else {
+            return Err(format!(
+                "backup entry '{}' is unsafe (path traversal) — refusing to restore",
+                file.name()
+            ));
+        };
+        let outpath = world_dir.join(safe_name);
+        if safe_zip_join(&world_dir, file.name()).is_none() {
+            return Err(format!(
+                "backup entry '{}' resolves outside world/ — refusing to restore",
+                file.name()
+            ));
+        }
 
         if file.is_dir() {
             std::fs::create_dir_all(&outpath)
@@ -2069,6 +2575,147 @@ pub fn delete_backup(
     std::fs::remove_file(&archive_path)
         .map_err(|e| format!("failed to delete backup: {e}"))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Backup scheduling + health alerts + metrics history + energy
+// ---------------------------------------------------------------------------
+
+/// Updates an instance's backup schedule (interval / retention / on-stop).
+#[tauri::command]
+pub fn update_backup_schedule(
+    app_handle: AppHandle,
+    id: String,
+    schedule: config::BackupSchedule,
+) -> Result<(), String> {
+    config::with_config_mut(&app_handle, |cfg| {
+        if let Some(instance) = cfg.servers.get_mut(&id) {
+            instance.backup_schedule = schedule;
+        }
+        Ok(())
+    })
+}
+
+/// Updates an instance's health-alert thresholds.
+#[tauri::command]
+pub fn update_alert_rules(
+    app_handle: AppHandle,
+    id: String,
+    rules: config::AlertRules,
+) -> Result<(), String> {
+    config::with_config_mut(&app_handle, |cfg| {
+        if let Some(instance) = cfg.servers.get_mut(&id) {
+            // Preserve the internal `crossed_since_secs` tracking field —
+            // don't let a UI save clobber the alert timer mid-flight.
+            let prev = instance.alert_rules.crossed_since_secs;
+            let mut r = rules;
+            r.crossed_since_secs = prev;
+            instance.alert_rules = r;
+        }
+        Ok(())
+    })
+}
+
+/// Returns historical metric samples for an instance within the window.
+/// `window_secs` e.g. 86400 = last 24h, 604800 = last 7d.
+#[tauri::command]
+pub fn get_metrics_history(
+    app_handle: AppHandle,
+    id: String,
+    window_secs: u64,
+) -> Result<Vec<MetricSample>, String> {
+    let history: tauri::State<'_, MetricsHistory> = app_handle.state();
+    Ok(history.query(&id, window_secs))
+}
+
+/// Estimates the energy cost of an instance over its running lifetime.
+///
+/// Cost = (avg_cpu_fraction × machine_watts × hours_running × price_per_kwh) / 1000.
+/// Idle baseline is ~30% of machine watts; load scales with CPU. Rough but
+/// useful — the number that justifies (or kills) the homelab.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnergyCost {
+    pub id: String,
+    /// Hours the instance has been observed running (from uptime tracking).
+    /// Falls back to an estimate from logs if unavailable.
+    pub hours: f64,
+    pub est_watts: f64,
+    pub cost: f64,
+    pub currency_note: String,
+}
+
+#[tauri::command]
+pub fn get_instance_energy(
+    app_handle: AppHandle,
+    id: String,
+) -> Result<EnergyCost, String> {
+    let cfg = config::load_config(&app_handle)?;
+    let price = cfg.settings.power_price_per_kwh;
+    let watts = cfg.settings.machine_watts;
+
+    // Estimate running hours from latest.log mtime (rough proxy): if the log
+    // is recent, assume running since the file's creation window. Absent a
+    // real uptime counter, use the log file's age capped to a sane max.
+    let instance = cfg
+        .servers
+        .get(&id)
+        .ok_or_else(|| format!("server '{id}' not found"))?;
+    let log_path = PathBuf::from(&instance.path).join("latest.log");
+    let hours = estimate_running_hours(&log_path);
+
+    // Approximate draw: idle floor 30% + CPU-scaled 70%. We don't have a live
+    // cpu reading here cheaply, so assume a blended 50% load for the estimate.
+    let est_watts = watts * (0.3 + 0.7 * 0.5);
+    let kwh = (est_watts * hours) / 1000.0;
+    let cost = kwh * price;
+
+    Ok(EnergyCost {
+        id,
+        hours,
+        est_watts,
+        cost,
+        currency_note: "cost uses your local price/kWh from settings".to_string(),
+    })
+}
+
+/// Rough running-hours estimate from a log file's mtime. Caps at 720h (30d)
+/// so a stale ancient log doesn't inflate the figure absurdly.
+fn estimate_running_hours(log_path: &std::path::Path) -> f64 {
+    let Ok(meta) = std::fs::metadata(log_path) else {
+        return 0.0;
+    };
+    let Some(mtime) = meta.modified().ok() else {
+        return 0.0;
+    };
+    let age_secs = SystemTime::now()
+        .duration_since(mtime)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // If the log was touched in the last hour, assume recently active; use the
+    // file size as a crude activity proxy (1KB ≈ ~6 min of typical logging).
+    let size_kb = meta.len() as f64 / 1024.0;
+    let from_size = (size_kb * 0.1).min(720.0); // ~6min/KB, cap 720h
+    if age_secs < 3600 {
+        from_size.max(1.0)
+    } else {
+        from_size
+    }
+}
+
+/// Updates an instance's saved command snippets (pinned terminal buttons).
+#[tauri::command]
+pub fn update_command_snippets(
+    app_handle: AppHandle,
+    id: String,
+    snippets: Vec<String>,
+) -> Result<(), String> {
+    config::with_config_mut(&app_handle, |cfg| {
+        if let Some(instance) = cfg.servers.get_mut(&id) {
+            instance.command_snippets = snippets;
+        }
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2248,6 +2895,15 @@ pub fn search_files(
     include: Option<String>,
     exclude: Option<String>,
 ) -> Result<Vec<SearchMatch>, String> {
+    // Bounded to keep the (synchronous) command responsive and memory-safe:
+    //   - MAX_RESULTS: stop once we have enough hits for a useful preview.
+    //   - MAX_DEPTH: don't descend into arbitrarily deep nested trees.
+    //   - MAX_CONTENT_BYTES: skip files larger than this when reading content
+    //     (avoids slurping multi-GB logs/jars into a String).
+    const MAX_RESULTS: usize = 1000;
+    const MAX_DEPTH: usize = 15;
+    const MAX_CONTENT_BYTES: u64 = 1024 * 1024; // 1 MiB
+
     let cfg = config::load_config(&app_handle)?;
     let instance = cfg
         .servers
@@ -2261,7 +2917,9 @@ pub fn search_files(
         .unwrap_or_default();
     let mut results: Vec<SearchMatch> = Vec::new();
     let query_lower = query.to_lowercase();
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(root).max_depth(MAX_DEPTH).into_iter().filter_map(|e| e.ok()) {
+        // Stop early once we have enough — a huge repo shouldn't keep scanning.
+        if results.len() >= MAX_RESULTS { break; }
         let path = entry.path();
         if !path.is_file() { continue; }
         let rel_path = path.strip_prefix(root)
@@ -2278,11 +2936,25 @@ pub fn search_files(
             }
         }
         if mode == "contents" || mode == "both" {
+            // Skip oversized files — reading a multi-GB log into a String would
+            // stall the command pool and risk OOM.
+            let size_ok = std::fs::metadata(path).map(|m| m.len() <= MAX_CONTENT_BYTES).unwrap_or(false);
+            if !size_ok { continue; }
             if let Ok(content) = std::fs::read_to_string(path) {
                 let mut line_num: u32 = 1;
                 for line in content.lines() {
+                    if results.len() >= MAX_RESULTS { break; }
                     if line.to_lowercase().contains(&query_lower) {
-                        let preview: String = if line.len() > 200 { format!("{}...", &line[..197]) } else { line.to_string() };
+                        // Truncate by *char* boundary, not byte index — slicing a
+                        // &str at an arbitrary byte can split a multibyte UTF-8
+                        // sequence and panic. take(197) is always char-safe.
+                        let preview: String = if line.chars().count() > 200 {
+                            let mut s: String = line.chars().take(197).collect();
+                            s.push_str("...");
+                            s
+                        } else {
+                            line.to_string()
+                        };
                         if !results.iter().any(|r| r.rel_path == rel_path && r.line_number == Some(line_num)) {
                             results.push(SearchMatch { rel_path: rel_path.clone(), line_number: Some(line_num), line_preview: Some(preview) });
                         }
@@ -2293,6 +2965,92 @@ pub fn search_files(
         }
     }
     Ok(results)
+}
+
+/// Result of a find-and-replace-across-files operation.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceResult {
+    pub files_changed: u32,
+    pub replacements: u32,
+}
+
+/// Finds `query` across the instance's files (content mode) and replaces each
+/// occurrence with `replacement`. Respects the same size/depth caps as search
+/// so a giant file can't stall it. Returns the count of files changed and
+/// total replacements. Case-sensitive.
+#[tauri::command]
+pub fn find_replace_in_files(
+    app_handle: AppHandle,
+    id: String,
+    query: String,
+    replacement: String,
+    include: Option<String>,
+    exclude: Option<String>,
+) -> Result<ReplaceResult, String> {
+    const MAX_DEPTH: usize = 15;
+    const MAX_CONTENT_BYTES: u64 = 1024 * 1024; // 1 MiB
+    const MAX_FILES: u32 = 500;
+
+    if query.is_empty() {
+        return Err("query must not be empty".to_string());
+    }
+    let cfg = config::load_config(&app_handle)?;
+    let instance = cfg
+        .servers
+        .get(&id)
+        .ok_or_else(|| format!("server '{id}' not found"))?;
+    let root = std::path::Path::new(&instance.path);
+    let include_pattern = include.as_deref().unwrap_or("*");
+    let exclude_patterns: Vec<&str> = exclude
+        .as_deref()
+        .map(|e| e.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+
+    let mut files_changed = 0u32;
+    let mut replacements = 0u32;
+
+    for entry in WalkDir::new(root).max_depth(MAX_DEPTH).into_iter().filter_map(|e| e.ok()) {
+        if files_changed >= MAX_FILES {
+            break;
+        }
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let rel_path = path
+            .strip_prefix(root)
+            .map(|p| p.to_string_lossy().replace("\\", "/"))
+            .unwrap_or_default();
+        let path_lower = rel_path.to_lowercase();
+        if !glob_match(&path_lower, include_pattern) {
+            continue;
+        }
+        if exclude_patterns.iter().any(|p| glob_match(&path_lower, p)) {
+            continue;
+        }
+        let size_ok = std::fs::metadata(path).map(|m| m.len() <= MAX_CONTENT_BYTES).unwrap_or(false);
+        if !size_ok {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if !content.contains(&query) {
+            continue;
+        }
+        let count = content.matches(&query).count() as u32;
+        let next = content.replace(&query, &replacement);
+        if std::fs::write(path, next).is_ok() {
+            files_changed += 1;
+            replacements += count;
+        }
+    }
+
+    Ok(ReplaceResult {
+        files_changed,
+        replacements,
+    })
 }
 
 #[tauri::command]

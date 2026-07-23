@@ -205,7 +205,8 @@ fn list_running(app: &AppHandle) -> Vec<RunningServerInfo> {
                 .map(|s| s.name.clone())
                 .unwrap_or_else(|| id.clone());
             let pid = registry.pid_for(&id).unwrap_or(0);
-            RunningServerInfo { id, name, pid }
+            let adopted = registry.is_adopted(&id);
+            RunningServerInfo { id, name, pid, adopted }
         })
         .collect()
 }

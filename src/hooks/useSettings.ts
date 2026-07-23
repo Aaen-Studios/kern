@@ -29,6 +29,12 @@ const DEFAULT_SETTINGS: AppSettings = {
   launchOnLogin: false,
   closeToTray: true,
   startHiddenInTray: false,
+  powerPricePerKwh: 0,
+  machineWatts: 120,
+  registryUrl: "https://kern.aaenz.no",
+  webRemoteEnabled: false,
+  webRemotePassphrase: "",
+  syncRepoUrl: "",
 };
 
 export function useSettings(): UseSettingsResult {

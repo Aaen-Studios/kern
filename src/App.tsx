@@ -22,6 +22,7 @@ import { useServers } from "./hooks/useServers";
 import { useLiveStatus } from "./hooks/useLiveStatus";
 import { UiStateProvider, useUiState } from "./hooks/useUiState";
 import { SidebarItemRegistryProvider } from "./hooks/useSidebarItems";
+import { ToastProvider, ToastViewport, useToast } from "./hooks/useToast";
 import type { NewServerInput, ServerInstance, SortPref } from "./types/server";
 
 type View =
@@ -97,13 +98,15 @@ export default function App() {
   onChangeRef.current = setSelectedId;
 
   return (
-    <UiStateProvider selectedServerId={selectedId}>
-      <SelectedIdBridgeContext.Provider value={onChangeRef}>
-        <SidebarItemRegistryProvider>
-          <AppInner />
-        </SidebarItemRegistryProvider>
-      </SelectedIdBridgeContext.Provider>
-    </UiStateProvider>
+    <ToastProvider>
+      <UiStateProvider selectedServerId={selectedId}>
+        <SelectedIdBridgeContext.Provider value={onChangeRef}>
+          <SidebarItemRegistryProvider>
+            <AppInner />
+          </SidebarItemRegistryProvider>
+        </SelectedIdBridgeContext.Provider>
+      </UiStateProvider>
+    </ToastProvider>
   );
 }
 
@@ -124,6 +127,16 @@ function AppInner() {
   } = useServers();
   const { uiState, setView, setSortPreference } = useUiState();
   const bridgeRef = useContext(SelectedIdBridgeContext);
+  const { notify } = useToast();
+
+  // Bridge the servers-list hook's local error into the global toast channel
+  // so it persists across navigation instead of vanishing on view change.
+  // Tracked by value so a repeated identical error still re-notifies.
+  useEffect(() => {
+    if (error) {
+      notify({ kind: "error", title: "Servers error", message: error });
+    }
+  }, [error, notify]);
 
   // Deep link state - .kern file path received via kern:// protocol or
   // .kern file-association double-click. The Rust backend resolves the
@@ -165,7 +178,7 @@ function AppInner() {
   // "stopped" while a process is actually running. Live status wins except when
   // an instance is orphaned (a dead path can't hide behind stale "running").
   const ids = useMemo(() => servers.map((s) => s.id), [servers]);
-  const { liveStatus } = useLiveStatus(ids);
+  const { liveStatus, liveAdopted } = useLiveStatus(ids);
   const serversLive = useMemo(
     () =>
       servers.map((s) =>
@@ -180,6 +193,37 @@ function AppInner() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setViewLocal] = useState<View>({ kind: "list" });
   const [restored, setRestored] = useState(false);
+
+  // Global event listeners: health alerts + backup completions from the
+  // background scheduler → surface as toasts so they persist across navigation.
+  useEffect(() => {
+    let unlistenAlert: (() => void) | undefined;
+    let unlistenBackup: (() => void) | undefined;
+    (async () => {
+      unlistenAlert = await listen<{
+        id: string; name: string; metric: string; value: number; threshold: number;
+      }>("kern://health-alert", (e) => {
+        const { name, metric, value, threshold } = e.payload;
+        notify({
+          kind: "warn",
+          title: `${name} — ${metric} high`,
+          message: `${Math.round(value * 100)}% (over ${Math.round(threshold * 100)}% threshold)`,
+        });
+      });
+      unlistenBackup = await listen<{ id: string; at: number }>("kern://backup-completed", (e) => {
+        const server = serversLive.find((s) => s.id === e.payload.id);
+        notify({
+          kind: "success",
+          title: "Backup saved",
+          message: server?.name ?? e.payload.id,
+        });
+      });
+    })();
+    return () => {
+      unlistenAlert?.();
+      unlistenBackup?.();
+    };
+  }, [notify, serversLive]);
 
   // Restore persisted view/selection once servers are loaded.
   useEffect(() => {
@@ -327,6 +371,7 @@ function AppInner() {
   );
 
   return (
+    <>
     <AppShell
       servers={serversSorted}
       selectedId={selectedId}
@@ -349,6 +394,7 @@ function AppInner() {
           <ServerDetailView
             key={selected.id}
             server={selected}
+            adopted={liveAdopted.has(selected.id)}
             onBack={() => navigate("list")}
             onStatusChange={handleStatusChange}
           />
@@ -356,12 +402,6 @@ function AppInner() {
           /* All other views: wrapped in a scrollable container so they
              still scroll within the now non-scrolling <main>. */
           <div className="h-full overflow-y-auto">
-            {error && (
-              <p className="m-4 text-[11px] text-fault-vector border border-fault-vector/40 bg-fault-vector/5 px-2 py-1">
-                {error}
-              </p>
-            )}
-
             {view.kind === "list" && (
               <ServerList
                 key="list"
@@ -424,6 +464,11 @@ function AppInner() {
         onConfirm={confirmDelete}
         onCancel={cancelDelete}
       />
+      {/* Global toast stack — fixed top-right, overlays all views, persists
+          across navigation and survives view crashes (lives outside the
+          ErrorBoundary that wraps the main view). */}
+      <ToastViewport />
     </AppShell>
+    </>
   );
 }

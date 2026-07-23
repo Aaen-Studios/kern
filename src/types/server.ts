@@ -40,6 +40,32 @@ export interface ServerInstance {
   userOverrides: Record<string, string>;
   /** When true, the instance launches automatically as kern starts. */
   autoStart: boolean;
+  /** Last-known OS pid of a running process (for re-adoption after restart). */
+  pid?: number | null;
+  /** Scheduled world backups. */
+  backupSchedule?: BackupSchedule;
+  /** Health-alert thresholds. */
+  alertRules?: AlertRules;
+  /** Shared terminal command history (newest last). */
+  commandHistory?: string[];
+  /** Pinned one-click command snippets. */
+  commandSnippets?: string[];
+}
+
+/** Per-instance backup schedule (mirrors config::BackupSchedule). */
+export interface BackupSchedule {
+  intervalSecs: number;
+  keep: number;
+  onStop: boolean;
+  lastBackupSecs: number;
+}
+
+/** Per-instance health-alert thresholds (mirrors config::AlertRules). */
+export interface AlertRules {
+  cpuThreshold?: number | null;
+  ramThreshold?: number | null;
+  sustainedSecs: number;
+  crossedSinceSecs?: number;
 }
 
 /** Global application settings. */
@@ -52,6 +78,18 @@ export interface AppSettings {
   closeToTray: boolean;
   /** When launched by the OS at login, start hidden in the tray. */
   startHiddenInTray: boolean;
+  /** Local electricity price per kWh. Drives the cost meter. 0 = disabled. */
+  powerPricePerKwh?: number;
+  /** Average machine power draw in watts (user-tuned to their hardware). */
+  machineWatts?: number;
+  /** Base URL of the plugin registry. */
+  registryUrl?: string;
+  /** Enable the optional web remote (LAN JSON API). */
+  webRemoteEnabled?: boolean;
+  /** Passphrase required to access the web remote (empty = open on LAN). */
+  webRemotePassphrase?: string;
+  /** Git repo URL for optional multi-machine registry sync. Empty = disabled. */
+  syncRepoUrl?: string;
 }
 
 /** Root config.json document. */

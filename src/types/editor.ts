@@ -27,6 +27,8 @@ export interface OpenFile {
   isDirty: boolean;
   /** Timestamp (epoch ms) of the last successful save. */
   savedAt: number;
+  /** On-disk mtime (epoch seconds) at last read/write — the conflict baseline. */
+  mtime?: number;
 }
 
 /** A tab entry derived from OpenFile for the tab bar. */

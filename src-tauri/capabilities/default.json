@@ -21,16 +21,6 @@
     "opener:default",
     "dialog:default",
     "updater:default",
-    "deep-link:default",
-    {
-      "identifier": "shell:allow-execute",
-      "allow": [
-        {
-          "name": "binaries",
-          "command": "",
-          "args": true
-        }
-      ]
-    }
+    "deep-link:default"
   ]
 }

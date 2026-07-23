@@ -77,6 +77,11 @@ pub struct ProcessRegistry {
     /// is registered for an id; the live value is stamped onto the RunningProcess
     /// and captured by its background task.
     generations: Mutex<HashMap<String, u64>>,
+    /// Re-adopted processes from a previous session, keyed by instance id →
+    /// the OS pid. These have NO Child handle / pipes — they're PID-only
+    /// monitors (liveness, metrics, tray, force-kill). A server is "running"
+    /// if it's in `processes` (owned) OR `adopted`.
+    adopted: Mutex<HashMap<String, u32>>,
 }
 
 impl ProcessRegistry {
@@ -99,20 +104,55 @@ impl ProcessRegistry {
     /// Returns the OS process id for a running instance, if it has one. Used by
     /// the metrics sampler to resolve the process tree without touching the
     /// `Child` handle (which would contend with the kill/wait paths).
+    /// Checks owned processes first, then re-adopted ones.
     pub fn pid_for(&self, id: &str) -> Option<u32> {
-        let map = self.processes.lock().ok()?;
-        map.get(id).map(|rp| rp.pid)
+        if let Some(pid) = self.processes.lock().ok()?.get(id).map(|rp| rp.pid) {
+            return Some(pid);
+        }
+        self.adopted.lock().ok()?.get(id).copied()
     }
 
     /// Returns the ids of every currently-running instance. Used to build the
     /// tray menu's "active servers" section and to back the
-    /// `list_running_servers` command. Takes the processes lock briefly and
-    /// drops the guard before returning.
+    /// `list_running_servers` command. Includes both owned and re-adopted.
     pub fn running_ids(&self) -> Vec<String> {
-        match self.processes.lock() {
+        let mut ids: Vec<String> = match self.processes.lock() {
             Ok(map) => map.keys().cloned().collect(),
             Err(_) => Vec::new(),
+        };
+        if let Ok(adopted) = self.adopted.lock() {
+            for id in adopted.keys() {
+                if !ids.contains(id) {
+                    ids.push(id.clone());
+                }
+            }
         }
+        ids
+    }
+
+    /// True if this instance is a re-adopted PID-only monitor (no Child handle,
+    /// no stdin/stdout pipes). Used by the stop path to choose force-kill over
+    /// graceful shutdown.
+    pub fn is_adopted(&self, id: &str) -> bool {
+        self.adopted.lock().ok().is_some_and(|m| m.contains_key(id))
+    }
+
+    /// Registers a re-adopted process by PID. Idempotent. Emits
+    /// `kern://running-set-changed` so the tray refreshes.
+    pub fn adopt(&self, handle: &AppHandle, id: &str, pid: u32) {
+        if let Ok(mut map) = self.adopted.lock() {
+            map.insert(id.to_string(), pid);
+        }
+        let _ = handle.emit("kern://running-set-changed", ());
+    }
+
+    /// Removes a re-adopted entry (process died or was force-killed). No-op if
+    /// it wasn't adopted.
+    pub fn unadopt(&self, handle: &AppHandle, id: &str) {
+        if let Ok(mut map) = self.adopted.lock() {
+            map.remove(id);
+        }
+        let _ = handle.emit("kern://running-set-changed", ());
     }
 
     /// Detaches all running processes: closes stdin and drops the child handle
@@ -344,6 +384,27 @@ pub(crate) fn suppress_window(cmd: &mut Command) {
 
 #[cfg(not(windows))]
 pub(crate) fn suppress_window(_cmd: &mut Command) {}
+
+/// Builds a `Command` that runs a user-typed ad-hoc line through the OS shell.
+///
+/// Unlike [`build_shell_command`] (which is for lifecycle launchers and rewrites
+/// bare names to `.bat`/`.sh`), this passes the user's input **verbatim** to the
+/// shell so builtins like `dir`, `echo`, `type`, `set`, `ls`, and pipelines /
+/// redirects all work — exactly what someone expects when typing into a terminal.
+///
+/// `raw_line` is the full trimmed input string (command + args as typed). On
+/// Windows: `cmd.exe /C "<line>"`; on Unix: `sh -c "<line>"`.
+pub(crate) fn build_adhoc_shell_command(raw_line: &str) -> Command {
+    if cfg!(windows) {
+        let mut c = Command::new("cmd.exe");
+        c.arg("/C").arg(raw_line);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(raw_line);
+        c
+    }
+}
 
 /// Builds a `Command` that runs `command` (with `args`) through the OS shell.
 ///
@@ -615,6 +676,16 @@ pub fn launch(
                 .ok()
                 .and_then(|mut map| map.remove(&id))
                 .map(|rp| rp.child.into_inner().expect("child lock poisoned"));
+            // The owned process exited — clear its persisted pid so a future
+            // app restart doesn't try to re-adopt a dead process.
+            let clear_handle = stdout_handle.clone();
+            let clear_id = id.clone();
+            let _ = crate::config::with_config_mut(&clear_handle, |cfg| {
+                if let Some(instance) = cfg.servers.get_mut(&clear_id) {
+                    instance.pid = None;
+                }
+                Ok(())
+            });
             let exit_code = match child_opt {
                 Some(mut child) => match child.wait() {
                     Ok(status) => status.code(),
@@ -718,6 +789,54 @@ pub fn stop(app_handle: &AppHandle, instance_id: &str) -> Result<(), String> {
         let _ = child.kill();
         let _ = child.wait();
     }
+    Ok(())
+}
+
+/// Force-kills a re-adopted (PID-only) process by OS pid and removes it from
+/// the adopted registry. Used when the user stops a server that was re-adopted
+/// from a previous session — there's no Child handle or stdin pipe, so graceful
+/// shutdown is impossible; this is the only option. Emits the termination
+/// events so the UI + tray sync.
+pub fn force_kill_adopted(app_handle: &AppHandle, instance_id: &str) -> Result<(), String> {
+    // Read the pid without removing — `unadopt` (called below) does the removal
+    // + emits kern://running-set-changed.
+    let Some(pid) = pid_for(app_handle, instance_id) else {
+        return Ok(()); // wasn't adopted — nothing to do
+    };
+    if !is_adopted(app_handle, instance_id) {
+        return Ok(()); // owned, not adopted — not our path
+    }
+
+    // Kill the process tree by PID. Same pattern as `stop`'s Windows branch.
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // SIGKILL the whole group if we were the group leader, else just the pid.
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
+    // Remove from the adopted registry + emit the running-set-changed signal
+    // (unadopt centralizes both). Also emit the status:Exited event so the UI
+    // syncs, matching the owned-process teardown.
+    use tauri::Emitter;
+    let registry: tauri::State<'_, ProcessRegistry> = app_handle.state();
+    registry.unadopt(app_handle, instance_id);
+    let status_event = format!("status:{instance_id}");
+    let _ = app_handle.emit(
+        &status_event,
+        StatusPayload::Exited { code: None },
+    );
     Ok(())
 }
 
@@ -863,11 +982,20 @@ pub fn write_stdin(
     Ok(())
 }
 
-/// Whether an instance currently has a tracked running process.
+/// Whether an instance currently has a tracked running process — either an
+/// owned Child handle or a re-adopted PID-only monitor.
 pub fn is_running(app_handle: &AppHandle, instance_id: &str) -> bool {
     let registry: tauri::State<'_, ProcessRegistry> = app_handle.state();
-    registry
+    let owned = registry
         .processes
+        .lock()
+        .map(|m| m.contains_key(instance_id))
+        .unwrap_or(false);
+    if owned {
+        return true;
+    }
+    registry
+        .adopted
         .lock()
         .map(|m| m.contains_key(instance_id))
         .unwrap_or(false)
@@ -878,4 +1006,10 @@ pub fn is_running(app_handle: &AppHandle, instance_id: &str) -> bool {
 pub fn pid_for(app_handle: &AppHandle, instance_id: &str) -> Option<u32> {
     let registry: tauri::State<'_, ProcessRegistry> = app_handle.state();
     registry.pid_for(instance_id)
+}
+
+/// True if this instance is a re-adopted PID-only monitor (no Child handle).
+pub fn is_adopted(app_handle: &AppHandle, instance_id: &str) -> bool {
+    let registry: tauri::State<'_, ProcessRegistry> = app_handle.state();
+    registry.is_adopted(instance_id)
 }

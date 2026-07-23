@@ -20,6 +20,9 @@ import { PluginTabContent } from "../plugins/PluginTabContent";
 import { MatrixBar } from "../matrix/MatrixBar";
 import { reactorChannelShader } from "../matrix/shaders/reactorChannel";
 import { FileEditorPanel } from "./FileEditorPanel";
+import { InstanceMonitor } from "./InstanceMonitor";
+import { useToast } from "../../hooks/useToast";
+import { ConfirmDialog } from "../ui/ConfirmDialog";
 import {
   PluginTabRegistryProvider,
   usePluginTabs,
@@ -34,10 +37,14 @@ import type { PluginTab, HostAPI } from "../../types/plugin";
 const BUILT_IN_TABS = [
   { id: "logs", label: "terminal" },
   { id: "files", label: "files" },
+  { id: "monitor", label: "monitor" },
 ] as const;
 
 interface ServerDetailViewProps {
   server: ServerInstance;
+  /** True when this instance is a re-adopted PID-only monitor (no graceful
+   *  stop, no live logs) — surfaced as a distinct badge + stop warning. */
+  adopted: boolean;
   onBack: () => void;
   /** Called after lifecycle actions so the parent can refresh registry state. */
   onStatusChange: () => void;
@@ -56,12 +63,23 @@ interface ServerDetailViewProps {
  */
 export function ServerDetailView({
   server,
+  adopted,
   onBack,
   onStatusChange,
 }: ServerDetailViewProps) {
   const { logs, running, launching, busy, launch, stop, install, restart, error, pushLine } =
     useServerControl(server.id, onStatusChange);
+  const { notify } = useToast();
   const { byId } = usePlugins();
+
+  // Bridge the lifecycle hook's local error into the global toast channel so
+  // start/stop/install failures persist across navigation. The inline banner
+  // is gone; the toast is now the single error surface for this view.
+  useEffect(() => {
+    if (error) {
+      notify({ kind: "error", title: server.name, message: error });
+    }
+  }, [error, notify, server.name]);
   // Live process-tree telemetry drives the header reactor bar. When the instance
   // isn't running the backend returns a zeroed reading, so the bar idles cleanly.
   const metrics = useMetrics(server.id);
@@ -74,6 +92,9 @@ export function ServerDetailView({
   const [input, setInput] = useState("");
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [showScrollButton, setShowScrollButton] = useState(false);
+  // Stop-confirmation dialog state. Stop is a destructive action on a running
+  // server (may interrupt a world save), so the button opens a confirm first.
+  const [stopConfirm, setStopConfirm] = useState(false);
   const inputHistoryRef = useRef<string[]>([]);
 
   // ── Persisted per-server UI state ──────────────────────────────────────
@@ -199,15 +220,14 @@ export function ServerDetailView({
             data: trimmed + "\n",
           });
         } else {
-          // Ad-hoc terminal command: split into command + args and fire.
-          const parts = trimmed.split(/\s+/);
-          if (parts.length > 0 && parts[0]) {
-            void invoke("run_terminal_command", {
-              id: server.id,
-              command: parts[0],
-              args: parts.slice(1),
-            });
-          }
+          // Ad-hoc terminal command: run the whole line through the OS shell
+          // in the instance directory. Await it so failures (bad command,
+          // non-zero exit) surface as an [error] line in the terminal instead
+          // of vanishing silently.
+          invoke("run_terminal_command", { id: server.id, line: trimmed }).catch((e: unknown) => {
+            const msg = e instanceof Error ? e.message : String(e);
+            pushLine(`[error] ${msg}`);
+          });
         }
       }
       inputHistoryRef.current.push(trimmed);
@@ -375,7 +395,17 @@ export function ServerDetailView({
                 ←
               </button>
               <div className="min-w-0">
-                <h2 className="text-sm text-zinc-100 truncate">{server.name}</h2>
+                <h2 className="text-sm text-zinc-100 truncate flex items-center gap-2">
+                  {server.name}
+                  {adopted && (
+                    <span
+                      className="text-[9px] tracking-[0.15em] uppercase text-warn-vector border border-warn-vector/40 px-1 py-px"
+                      title="Re-adopted from a previous session — PID-only monitor. Graceful stop and live logs are unavailable; stop force-kills the process."
+                    >
+                      adopted
+                    </span>
+                  )}
+                </h2>
                 <p className="text-[11px] text-zinc-500 font-mono truncate">
                   {server.id} · {server.serverType}
                 </p>
@@ -428,7 +458,7 @@ export function ServerDetailView({
             launching={launching}
             server={server}
             restart={restart}
-            stop={stop}
+            onStopRequest={() => setStopConfirm(true)}
             install={install}
             handleInstalled={handleInstalled}
             launch={launch}
@@ -462,12 +492,6 @@ export function ServerDetailView({
           </dl>
         </div>
 
-        {error && (
-          <p className="m-4 text-[11px] text-fault-vector border border-fault-vector/40 bg-fault-vector/5 px-2 py-1">
-            {error}
-          </p>
-        )}
-
         {server.isOrphaned && (
           <p className="m-4 text-[11px] text-fault-vector border border-fault-vector/40 bg-fault-vector/5 px-2 py-1">
             [orphaned] path inaccessible — instance marked orphaned. Cannot launch
@@ -490,6 +514,7 @@ export function ServerDetailView({
           activeTab={activeTab}
           setActiveTab={setActiveTab}
           logs={logs}
+          running={running}
           terminalRef={terminalRef}
           handleScroll={handleScroll}
           showScrollButton={showScrollButton}
@@ -502,6 +527,27 @@ export function ServerDetailView({
         />
       </div>
       </ToolbarActionRegistryProvider>
+
+      {/* Stop confirmation — stop can interrupt a running server mid-save, so
+          it's gated behind a confirm (danger variant). The graceful-shutdown
+          timeout in the backend bounds how long this can take. */}
+      <ConfirmDialog
+        open={stopConfirm}
+        title="Stop server"
+        message={
+          adopted
+            ? `Stop "${server.name}"? This server was re-adopted from a previous session, so a graceful shutdown isn't possible — it will be force-killed immediately. Unsaved work may be lost.`
+            : `Stop "${server.name}"? A graceful shutdown is attempted first (the server is given time to save state), but work in progress may be lost.`
+        }
+        confirmLabel="stop"
+        cancelLabel="cancel"
+        variant="danger"
+        onConfirm={async () => {
+          setStopConfirm(false);
+          await stop();
+        }}
+        onCancel={() => setStopConfirm(false)}
+      />
     </PluginTabRegistryProvider>
   );
 }
@@ -513,6 +559,7 @@ interface TabSectionProps {
   activeTab: string;
   setActiveTab: (tab: string) => void;
   logs: string[];
+  running: boolean;
   terminalRef: React.RefObject<HTMLDivElement | null>;
   handleScroll: () => void;
   showScrollButton: boolean;
@@ -533,6 +580,7 @@ function TabSection({
   activeTab,
   setActiveTab,
   logs,
+  running,
   terminalRef,
   handleScroll,
   showScrollButton,
@@ -544,6 +592,46 @@ function TabSection({
   handleSubmit,
 }: TabSectionProps) {
   const { tabs: pluginTabs, getTab } = usePluginTabs();
+
+  // Pinned command snippets — one-click terminal buttons. Persisted per instance.
+  const snippets = server.commandSnippets ?? [];
+
+  // Command-history autosuggest: as the user types, surface matching past
+  // commands (newest first, deduped). Rendered as a small dropdown above input.
+  const history = useMemo(() => {
+    const all = server.commandHistory ?? [];
+    // newest first, unique, capped.
+    return [...new Set([...all].reverse())].slice(0, 20);
+  }, [server.commandHistory]);
+  const suggestions = useMemo(() => {
+    const q = input.trim().toLowerCase();
+    if (!q) return [];
+    return history.filter((h) => h.toLowerCase().includes(q)).slice(0, 5);
+  }, [history, input]);
+
+  const pinSnippet = useCallback(
+    async (cmd: string) => {
+      if (snippets.includes(cmd)) return;
+      const next = [...snippets, cmd].slice(-12);
+      await invoke("update_command_snippets", { id: server.id, snippets: next });
+      // Optimistic local mutation so the button appears immediately.
+      server.commandSnippets = next;
+      setInput("");
+    },
+    [snippets, server],
+  );
+  const runSnippet = useCallback(
+    (cmd: string) => {
+      // Fill the input so the user sees what will run, then focus + select so
+      // Enter sends it. We don't auto-submit to avoid a stale-closure dispatch
+      // of the lifecycle logic — the one keystroke keeps the flow explicit.
+      setInput(cmd);
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    },
+    [inputRef],
+  );
+
 
   // Build a combined tab list: built-in first, then plugin tabs.
   const allTabs = useMemo(() => {
@@ -670,6 +758,40 @@ function TabSection({
 
           {/* Terminal input */}
           <div className="shrink-0 border-t border-grid-bounds bg-bg-surface px-3 py-2">
+            {/* Pinned command snippets — one-click send. */}
+            {snippets.length > 0 && (
+              <div className="flex flex-wrap gap-1 mb-2">
+                {snippets.map((s, i) => (
+                  <button
+                    key={i}
+                    onClick={() => void runSnippet(s)}
+                    className="text-[10px] font-mono px-1.5 py-0.5 border border-grid-bounds text-zinc-400 hover:border-signal-low hover:text-zinc-200 transition-colors"
+                    title={`run: ${s}`}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            )}
+            {/* History autosuggest — matching past commands as you type. */}
+            {suggestions.length > 0 && (
+              <div className="mb-1 border border-grid-bounds bg-bg-core max-h-32 overflow-y-auto">
+                {suggestions.map((s, i) => (
+                  <button
+                    key={i}
+                    type="button"
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      setInput(s);
+                      inputRef.current?.focus();
+                    }}
+                    className="block w-full text-left px-2 py-1 text-[10px] font-mono text-zinc-400 hover:bg-bg-surface hover:text-zinc-200 transition-colors"
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            )}
             <form onSubmit={handleSubmit} className="flex items-center gap-2">
               <span className="text-signal-high text-[11px] font-mono select-none">{">"}</span>
               <input
@@ -682,6 +804,17 @@ function TabSection({
                 spellCheck={false}
                 autoComplete="off"
               />
+              {/* Pin the current input as a snippet for one-click reuse. */}
+              {input.trim() && (
+                <button
+                  type="button"
+                  onClick={() => pinSnippet(input.trim())}
+                  className="text-[10px] text-zinc-600 hover:text-signal-high transition-colors"
+                  title="pin as a one-click button"
+                >
+                  + pin
+                </button>
+              )}
             </form>
           </div>
         </>
@@ -691,7 +824,11 @@ function TabSection({
         <FileEditorPanel serverId={server.id} />
       )}
 
-      {activePluginTab && activeTab !== "logs" && activeTab !== "files" && (
+      {activeTab === "monitor" && (
+        <InstanceMonitor server={server} running={running} />
+      )}
+
+      {activePluginTab && activeTab !== "logs" && activeTab !== "files" && activeTab !== "monitor" && (
         <PluginTabContent
           tab={activePluginTab}
           serverData={server}
@@ -715,7 +852,8 @@ interface HeaderToolbarProps {
   launching: boolean;
   server: ServerInstance;
   restart: () => Promise<void>;
-  stop: () => Promise<void>;
+  /** Opens the stop-confirmation dialog (stop is a destructive action). */
+  onStopRequest: () => void;
   install: () => Promise<void>;
   handleInstalled: () => Promise<void>;
   launch: () => Promise<void>;
@@ -732,7 +870,7 @@ interface HeaderToolbarProps {
 function HeaderToolbar({
   liveHex, liveStatus, isEffectivelyRunning, transitioning,
   hasInstallStep, installed, busy, launching,
-  server, restart, stop, install, handleInstalled, launch, onSaveStartCommand, onToggleAutoStart,
+  server, restart, onStopRequest, install, handleInstalled, launch, onSaveStartCommand, onToggleAutoStart,
 }: HeaderToolbarProps) {
   const { actions } = useToolbarActions();
 
@@ -770,7 +908,7 @@ function HeaderToolbar({
             restart
           </button>
           <button
-            onClick={stop}
+            onClick={onStopRequest}
             disabled={transitioning}
             className="px-3 py-1.5 text-xs text-bg-core bg-fault-vector hover:opacity-80 font-semibold transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
           >

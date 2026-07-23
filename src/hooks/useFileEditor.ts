@@ -29,6 +29,8 @@ export interface FileEditorState {
   tabs: { relPath: string; name: string; language: string; isDirty: boolean }[];
   /** The active OpenFile object, or null. */
   activeFileData: OpenFile | null;
+  /** A path with an unresolved on-disk conflict (save was blocked), or null. */
+  conflict: string | null;
 }
 
 export interface FileEditorActions {
@@ -58,6 +60,12 @@ export interface FileEditorActions {
   renamePath: (oldRelPath: string, newRelPath: string) => Promise<void>;
   /** Clear the current error. */
   clearError: () => void;
+  /** Force-save a file, ignoring the on-disk conflict (user chose overwrite). */
+  forceSave: (relPath: string) => Promise<void>;
+  /** Reload a file from disk, discarding local edits (user chose reload). */
+  reloadFile: (relPath: string) => Promise<void>;
+  /** Dismiss the active conflict prompt without acting. */
+  dismissConflict: () => void;
 }
 
 /**
@@ -96,6 +104,7 @@ export function useFileEditor(serverId: string): FileEditorState & FileEditorAct
   const [activeFile, setActiveFileState] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [conflict, setConflict] = useState<string | null>(null);
 
   // Refs to avoid stale closures in callbacks.
   const openFilesRef = useRef(openFiles);
@@ -142,11 +151,14 @@ export function useFileEditor(serverId: string): FileEditorState & FileEditorAct
         // We need to check the file size first via a directory listing of the parent.
         // Simpler: just try to read and handle errors gracefully.
         let content: string;
+        let mtime: number | undefined;
         try {
-          content = await invoke<string>("read_server_file", {
+          const res = await invoke<{ content: string; mtime: number }>("read_server_file", {
             id: serverId,
             relPath,
           });
+          content = res.content;
+          mtime = res.mtime;
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
           if (msg.includes("is not a file") || msg.includes("does not exist")) {
@@ -169,6 +181,7 @@ export function useFileEditor(serverId: string): FileEditorState & FileEditorAct
           language,
           isDirty: false,
           savedAt: Date.now(),
+          mtime,
         };
 
         setOpenFiles((prev) => {
@@ -209,23 +222,105 @@ export function useFileEditor(serverId: string): FileEditorState & FileEditorAct
       if (!file.isDirty) return;
 
       await safeCall(async () => {
-        await invoke("write_server_file", {
+        let newMtime: number;
+        try {
+          newMtime = await invoke<number>("write_server_file", {
+            id: serverId,
+            relPath,
+            content: file.content,
+            expectedMtime: file.mtime,
+          });
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          // Conflict: the file changed on disk since our baseline. Surface the
+          // conflict prompt instead of overwriting — the user decides.
+          if (msg.startsWith("conflict:")) {
+            setConflict(relPath);
+            return;
+          }
+          throw e;
+        }
+        setOpenFiles((prev) => {
+          const next = new Map(prev);
+          const existing = next.get(relPath);
+          if (existing) {
+            next.set(relPath, {
+              ...existing,
+              isDirty: false,
+              savedAt: Date.now(),
+              mtime: newMtime,
+            });
+          }
+          return next;
+        });
+        setConflict(null);
+      });
+    },
+    [serverId, safeCall],
+  );
+
+  // Force-save: write without the mtime guard. Used when the user explicitly
+  // chooses "overwrite" after a conflict.
+  const forceSave = useCallback(
+    async (relPath: string) => {
+      const file = openFilesRef.current.get(relPath);
+      if (!file) return;
+      await safeCall(async () => {
+        const newMtime = await invoke<number>("write_server_file", {
           id: serverId,
           relPath,
           content: file.content,
+          expectedMtime: null,
         });
         setOpenFiles((prev) => {
           const next = new Map(prev);
           const existing = next.get(relPath);
           if (existing) {
-            next.set(relPath, { ...existing, isDirty: false, savedAt: Date.now() });
+            next.set(relPath, {
+              ...existing,
+              isDirty: false,
+              savedAt: Date.now(),
+              mtime: newMtime,
+            });
           }
           return next;
         });
+        setConflict(null);
       });
     },
     [serverId, safeCall],
   );
+
+  // Reload: discard local edits and re-read from disk. Used when the user
+  // chooses "reload" after a conflict (or to discard their changes).
+  const reloadFile = useCallback(
+    async (relPath: string) => {
+      await safeCall(async () => {
+        const res = await invoke<{ content: string; mtime: number }>("read_server_file", {
+          id: serverId,
+          relPath,
+        });
+        setOpenFiles((prev) => {
+          const next = new Map(prev);
+          const existing = next.get(relPath);
+          if (existing) {
+            next.set(relPath, {
+              ...existing,
+              content: res.content,
+              mtime: res.mtime,
+              isDirty: false,
+              savedAt: Date.now(),
+            });
+          }
+          return next;
+        });
+        setConflict(null);
+      });
+    },
+    [serverId, safeCall],
+  );
+
+  const dismissConflict = useCallback(() => setConflict(null), []);
 
   const saveAllFiles = useCallback(async () => {
     const dirty = Array.from(openFilesRef.current.values()).filter((f) => f.isDirty);
@@ -357,6 +452,7 @@ export function useFileEditor(serverId: string): FileEditorState & FileEditorAct
     dirtyCount,
     tabs,
     activeFileData,
+    conflict,
     // Actions
     openFile,
     closeFile,
@@ -371,5 +467,8 @@ export function useFileEditor(serverId: string): FileEditorState & FileEditorAct
     createDirectory,
     renamePath,
     clearError,
+    forceSave,
+    reloadFile,
+    dismissConflict,
   };
 }
